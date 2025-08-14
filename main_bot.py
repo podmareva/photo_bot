@@ -15,17 +15,12 @@ from PIL import Image, ImageFilter
 import numpy as np
 import cv2
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    FSInputFile,
-    BufferedInputFile,
-)
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import Message, FSInputFile, BufferedInputFile
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import CommandStart
-from aiogram import Router
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 # webhook + aiohttp server
@@ -33,30 +28,12 @@ from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from io import BytesIO
-import requests
-
-import os, requests
-
-PIXELCUT_API_KEY = os.getenv("PIXELCUT_API_KEY", "").strip()
-
-def build_pixelcut_headers() -> dict:
-    """
-    Если ключ похож на JWT (три части через точки) — шлём как Bearer.
-    Иначе используем X-API-KEY.
-    """
-    if PIXELCUT_API_KEY.count(".") == 2:  # Header.Payload.Signature
-        return {"Authorization": f"Bearer {PIXELCUT_API_KEY}"}
-    else:
-        return {"X-API-KEY": PIXELCUT_API_KEY}
-
 
 # ========= ENV / CONFIG =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PIXELCUT_API_KEY = os.getenv("PIXELCUT_API_KEY")
-PIXELCUT_ENDPOINT = os.getenv(
-    "PIXELCUT_ENDPOINT", "https://api.developer.pixelcut.ai/v1/remove-background"
-)
+PIXELCUT_API_KEY = os.getenv("PIXELCUT_API_KEY", "").strip()
+PIXELCUT_ENDPOINT = os.getenv("PIXELCUT_ENDPOINT", "https://api.developer.pixelcut.ai/v1/remove-background")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 MAIN_BOT_USERNAME = os.getenv("MAIN_BOT_USERNAME", "")
@@ -66,7 +43,7 @@ assert BOT_TOKEN, "BOT_TOKEN is required"
 # === OPTIONAL PG (сохраняем только метаданные/file_id) ===
 import psycopg2
 
-def db_exec(q: str, params: tuple = ()):  # очень простой helper
+def db_exec(q: str, params: tuple = ()):
     if not DATABASE_URL:
         return None
     conn = psycopg2.connect(DATABASE_URL)
@@ -93,16 +70,7 @@ def gallery_save(
     db_exec(
         """INSERT INTO items(user_id, src_file_id, cut_file_id, placement, size_aspect, style_text, n_variants, result_file_ids)
            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (
-            user_id,
-            src_file_id,
-            cut_file_id,
-            placement,
-            size_aspect,
-            style_text,
-            n_variants,
-            result_file_ids,
-        ),
+        (user_id, src_file_id, cut_file_id, placement, size_aspect, style_text, n_variants, result_file_ids),
     )
 
 def gallery_last(user_id: int):
@@ -199,7 +167,7 @@ PROMPTS_MD = """# 📓 Шпаргалка по промптам для гене�
 - editorial style portrait, soft backlight glow, minimal makeup — фэшн-портрет, мягкая подсветка
 
 ## 9) В руках (автоген)
-- photorealistic hands close-up, neutral background, soft window light, macro-friendly composition — крупный план рук, мягкий свет из окна
+- photorealistic hands close-up, neutral background, soft window light, macro-friendly composition — крупный план рук, мяглый свет из окна
 - female hands, natural skin texture, shallow depth of field — женские руки, естественная кожа, малая ГРИП
 - hands holding space, warm interior bokeh, cozy mood — руки с «пустым местом», тёплое боке
 
@@ -344,14 +312,15 @@ async def load_bytes_by_file_id(bot: Bot, file_id: str) -> bytes:
     buf = io.BytesIO()
     await bot.download(file_id, destination=buf)
     return buf.getvalue()
-	
+
+# ====== REMBG (free) ======
 def remove_bg_rembg_bytes(image_bytes: bytes) -> bytes:
     try:
         from rembg import remove, new_session
     except Exception as e:
         raise RuntimeError(f"rembg недоступен: {e}")
     try:
-        session = new_session("u2netp")     # меньше RAM и быстрее
+        session = new_session("u2netp")  # меньше RAM и быстрее
         return remove(image_bytes, session=session)
     except Exception as e:
         raise RuntimeError(f"Ошибка rembg: {e}")
@@ -359,7 +328,6 @@ def remove_bg_rembg_bytes(image_bytes: bytes) -> bytes:
 import asyncio
 
 async def remove_bg_rembg_bytes_async(image_bytes: bytes) -> bytes:
-    # переносим тяжёлую работу в поток
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, remove_bg_rembg_bytes, image_bytes)
 
@@ -369,51 +337,40 @@ async def generate_with_rembg_or_timeout(image_bytes: bytes) -> bytes:
     except asyncio.TimeoutError:
         raise RuntimeError("rembg: истек таймаут 40с. Попробуйте Премиум или другое фото.")
 
-import os, requests
-
-def build_pixelcut_headers() -> dict:
-    key = os.getenv("PIXELCUT_API_KEY", "").strip()
-    if key.count(".") == 2:               # JWT: Header.Payload.Signature
-        return {"Authorization": f"Bearer {key}"}
-    return {"X-API-KEY": key}
-
+# ====== Pixelcut (premium) ======
 def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
-    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    """Гарантируем корректный RGB-JPEG без альфы для внешнего API."""
+    img = Image.open(BytesIO(image_bytes))
+    if img.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=95)
     return buf.getvalue()
-    
-def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
-    endpoint = os.getenv("PIXELCUT_ENDPOINT")
-    if not endpoint:
-        raise RuntimeError("PIXELCUT_ENDPOINT не задан")
 
+def build_pixelcut_headers() -> dict:
+    """Официальный метод Pixelcut: ключ в X-API-Key."""
+    if not PIXELCUT_API_KEY:
+        raise RuntimeError("PIXELCUT_API_KEY не задан")
+    return {"X-API-Key": PIXELCUT_API_KEY}
+
+def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
+    if not PIXELCUT_ENDPOINT:
+        raise RuntimeError("PIXELCUT_ENDPOINT не задан")
     headers = build_pixelcut_headers()
     jpg = ensure_jpg_bytes(image_bytes)
-
-    def call(field_name: str) -> bytes:
-        files = {field_name: ("input.jpg", BytesIO(jpg), "image/jpeg")}
-        r = requests.post(endpoint, headers=headers, files=files, timeout=120)
-        if r.status_code == 200:
-            return r.content
-        try:
-            detail = r.json()
-        except Exception:
-            detail = r.text
-        raise RuntimeError(f"Ошибка Pixelcut: {r.status_code}: {detail}")
-
-    # Автоподбор имени поля файла — частая причина 400
-    for field in ("image", "image_file", "file", "file_upload"):
-        try:
-            return call(field)
-        except RuntimeError as e:
-            msg = str(e)
-            if ("Unsupported format" in msg
-                or "invalid_parameter" in msg
-                or "unsupported" in msg.lower()):
-                continue
-            raise
-    raise RuntimeError("Pixelcut: ни одно из имён полей не подошло")
+    files = {"image": ("input.jpg", BytesIO(jpg), "image/jpeg")}  # одно поле 'image'
+    r = requests.post(PIXELCUT_ENDPOINT, headers=headers, files=files, timeout=120)
+    if r.status_code == 200:
+        return r.content
+    try:
+        detail = r.json()
+    except Exception:
+        detail = r.text
+    raise RuntimeError(f"Ошибка Pixelcut: {r.status_code}: {detail}")
 
 def pick_openai_size(aspect: str) -> str:
     if aspect == "1:1":
@@ -627,7 +584,6 @@ async def generate_result(message: Message, state: FSMContext):
         else:
             cut_png = await generate_with_rembg_or_timeout(image_bytes)
 
-
         result_file_ids: List[str] = []
 
         for i in range(n_variants):
@@ -673,7 +629,7 @@ async def generate_result(message: Message, state: FSMContext):
             filename = f"product_{i+1}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png"
             await message.answer_document(BufferedInputFile(data_bytes, filename), caption=f"Вариант {i+1}/{n_variants}")
 
-        # 5) сохранить запись в галерее (метаданные и file_id — если нужно, перехватывай file_id через send result)
+        # 5) сохранить запись в галерее
         try:
             src_id = data.get("image_file_id", "")
             gallery_save(
@@ -713,9 +669,6 @@ async def repeat_last(message: Message, state: FSMContext):
     await state.set_state(GenStates.waiting_style)
 
 # === Webhook server (единый) ===
-from aiohttp import web
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 assert BASE_URL, "WEBHOOK_BASE_URL или RENDER_EXTERNAL_URL должны быть заданы"
@@ -733,5 +686,4 @@ SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
 setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_app)
 
 if __name__ == "__main__":
-    # ВАЖНО: слушаем порт от Render
     web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
