@@ -56,12 +56,6 @@ def build_pixelcut_headers() -> dict:
     else:
         return {"X-API-KEY": PIXELCUT_API_KEY}
 
-# === OPTIONAL local free remover ===
-try:
-    from rembg import remove as rembg_remove
-    REMBG_AVAILABLE = True
-except Exception:
-    REMBG_AVAILABLE = False
 
 # ========= ENV / CONFIG =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -373,17 +367,6 @@ def remove_bg_rembg_bytes(image_bytes: bytes) -> bytes:
         return remove(image_bytes, session=session)
     except Exception as e:
         raise RuntimeError(f"Ошибка rembg: {e}")
-
-
-
-from io import BytesIO
-from PIL import Image
-
-def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
-    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=95)
-    return buf.getvalue()
 
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     jpg = ensure_jpg_bytes(image_bytes)
@@ -698,30 +681,22 @@ async def repeat_last(message: Message, state: FSMContext):
     await message.answer("Повторим. Выбери стиль/пресет или напиши свой промпт.", reply_markup=STYLE_KB)
     await state.set_state(GenStates.waiting_style)
 
-import os
-from aiohttp import web
-from aiogram import Bot, Dispatcher
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+# === Webhook server (единый) ===
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
+assert BASE_URL, "WEBHOOK_BASE_URL или RENDER_EXTERNAL_URL должны быть заданы"
+WEBHOOK_URL = BASE_URL + WEBHOOK_PATH
 
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/") + WEBHOOK_PATH  # у Render есть эта переменная
-
-bot = Bot(TOKEN)
-dp = Dispatcher()
-
-async def on_startup(app):
+async def on_startup_app(app: web.Application):
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
 
-async def on_shutdown(app):
+async def on_shutdown_app(app: web.Application):
     await bot.delete_webhook()
     await bot.session.close()
 
-def main():
-    app = web.Application()
-    SimpleRequestHandler(dp, bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, on_startup=on_startup, on_shutdown=on_shutdown)
-    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+app = web.Application()
+SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_app)
 
 if __name__ == "__main__":
-    main()
+    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
