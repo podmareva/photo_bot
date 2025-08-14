@@ -6,4 +6,5 @@ psycopg2-binary
 opencv-python-headless
 numpy
 python-dotenv
-rembg
+rembg==2.0.57
+onnxruntime==1.17.3
