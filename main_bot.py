@@ -357,47 +357,49 @@ async def load_bytes_by_file_id(bot: Bot, file_id: str) -> bytes:
     buf = io.BytesIO()
     await bot.download(file_id, destination=buf)
     return buf.getvalue()
-
+	
 def remove_bg_rembg_bytes(image_bytes: bytes) -> bytes:
+    """
+    Вырез фона через rembg с ленивым импортом и облегчённой моделью (u2netp).
+    """
     try:
-        from rembg import remove
+        from rembg import remove, new_session
     except Exception as e:
         raise RuntimeError(f"rembg недоступен: {e}")
-    return remove(image_bytes)
 
+    try:
+        # u2netp заметно легче по памяти, чем u2net
+        session = new_session("u2netp")
+        return remove(image_bytes, session=session)
+    except Exception as e:
+        raise RuntimeError(f"Ошибка rembg: {e}")
+
+
+
+from io import BytesIO
+from PIL import Image
+
+def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
 
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
-    """
-    Вырез фона через Pixelcut.
-    Конвертируем вход в JPEG, чтобы избежать 400 Unsupported format.
-    """
     jpg = ensure_jpg_bytes(image_bytes)
-
-    # пример для requests; подставь свой endpoint и ключ, если они у тебя в env
-    import os, requests
-
-    endpoint = os.getenv("PIXELCUT_ENDPOINT")  # например: "https://api.pixelcut.ai/v1/remove-background"
-    api_key = os.getenv("PIXELCUT_API_KEY")
-
     headers = build_pixelcut_headers()
 
-    files = {
-        # ключ 'image' — наиболее типичный; если у тебя другой — оставь как в твоём коде
-        "image": ("input.jpg", BytesIO(jpg), "image/jpeg"),
-    }
+    endpoint = os.getenv("PIXELCUT_ENDPOINT")  # проверь, что .env не пустой/без кавычек
+    files = {"image": ("input.jpg", BytesIO(jpg), "image/jpeg")}
 
-    # если раньше отправлялись параметры — оставь их как было
-    resp = requests.post(endpoint, headers=headers, files=files, timeout=120)
-
-    if resp.status_code != 200:
-        # покажем понятную причину из тела ответа
+    r = requests.post(endpoint, headers=headers, files=files, timeout=120)
+    if r.status_code != 200:
         try:
-            detail = resp.json()
+            detail = r.json()
         except Exception:
-            detail = resp.text
-        raise RuntimeError(f"Ошибка Pixelcut: {resp.status_code}: {detail}")
-
-    return resp.content  # если API возвращает уже байты изображения
+            detail = r.text
+        raise RuntimeError(f"Ошибка Pixelcut: {r.status_code}: {detail}")
+    return r.content
 
 
 def pick_openai_size(aspect: str) -> str:
