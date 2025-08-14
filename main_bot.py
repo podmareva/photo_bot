@@ -359,20 +359,11 @@ async def load_bytes_by_file_id(bot: Bot, file_id: str) -> bytes:
     return buf.getvalue()
 
 def remove_bg_rembg_bytes(image_bytes: bytes) -> bytes:
-    """
-    Вырез фона через rembg.
-    Даёт понятную ошибку, если rembg/onnxruntime не установлены.
-    """
     try:
         from rembg import remove
     except Exception as e:
-        # чтобы в логах и в чате была причина
         raise RuntimeError(f"rembg недоступен: {e}")
-
-    try:
-        return remove(image_bytes)
-    except Exception as e:
-        raise RuntimeError(f"Ошибка rembg: {e}")
+    return remove(image_bytes)
 
 
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
@@ -705,28 +696,30 @@ async def repeat_last(message: Message, state: FSMContext):
     await message.answer("Повторим. Выбери стиль/пресет или напиши свой промпт.", reply_markup=STYLE_KB)
     await state.set_state(GenStates.waiting_style)
 
-# ========= webhook server (aiohttp) =========
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
-assert WEBHOOK_BASE_URL, "WEBHOOK_BASE_URL is required"
-WEBHOOK_URL = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+import os
+from aiohttp import web
+from aiogram import Bot, Dispatcher
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.environ.get("PORT", 10000))
+TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/") + WEBHOOK_PATH  # у Render есть эта переменная
 
-async def on_startup_app(app: web.Application):
-    await bot.set_webhook(WEBHOOK_URL)
-    await _log_bot_info()
-    logging.info("Webhook set: %s", WEBHOOK_URL)
+bot = Bot(TOKEN)
+dp = Dispatcher()
 
-async def on_shutdown_app(app: web.Application):
+async def on_startup(app):
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+
+async def on_shutdown(app):
     await bot.delete_webhook()
-    logging.info("Webhook deleted")
+    await bot.session.close()
 
-app = web.Application()
-SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_app)
+def main():
+    app = web.Application()
+    SimpleRequestHandler(dp, bot).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, on_startup=on_startup, on_shutdown=on_shutdown)
+    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
 if __name__ == "__main__":
-    logging.info("Server starting on %s:%s", WEBAPP_HOST, WEBAPP_PORT)
-    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+    main()
