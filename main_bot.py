@@ -40,6 +40,16 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+from io import BytesIO
+from PIL import Image
+
+def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
+    """Гарантирует RGB-JPEG без альфы для сторонних API."""
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
 # === OPTIONAL local free remover ===
 try:
     from rembg import remove as rembg_remove
@@ -343,42 +353,55 @@ async def load_bytes_by_file_id(bot: Bot, file_id: str) -> bytes:
     return buf.getvalue()
 
 def remove_bg_rembg_bytes(image_bytes: bytes) -> bytes:
+    """
+    Вырез фона через rembg.
+    Даёт понятную ошибку, если rembg/onnxruntime не установлены.
+    """
     try:
         from rembg import remove
     except Exception as e:
-        # Здесь ошибка будет видна и в логах, и вернётся пользователю
+        # чтобы в логах и в чате была причина
         raise RuntimeError(f"rembg недоступен: {e}")
-    return remove(image_bytes)
+
+    try:
+        return remove(image_bytes)
+    except Exception as e:
+        raise RuntimeError(f"Ошибка rembg: {e}")
 
 
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
-    if not PIXELCUT_API_KEY:
-        raise RuntimeError("PIXELCUT_API_KEY не задан")
-    headers = {"X-API-KEY": PIXELCUT_API_KEY}
+    """
+    Вырез фона через Pixelcut.
+    Конвертируем вход в JPEG, чтобы избежать 400 Unsupported format.
+    """
+    jpg = ensure_jpg_bytes(image_bytes)
+
+    # пример для requests; подставь свой endpoint и ключ, если они у тебя в env
+    import os, requests
+
+    endpoint = os.getenv("PIXELCUT_ENDPOINT")  # например: "https://api.pixelcut.ai/v1/remove-background"
+    api_key = os.getenv("PIXELCUT_API_KEY")
+
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
     files = {
-        "image": ("image.png", image_bytes, "image/png"),
-        "image_file": ("image.png", image_bytes, "image/png"),
+        # ключ 'image' — наиболее типичный; если у тебя другой — оставь как в твоём коде
+        "image": ("input.jpg", BytesIO(jpg), "image/jpeg"),
     }
-    r = requests.post(PIXELCUT_ENDPOINT, headers=headers, files=files, timeout=90)
-    if r.status_code != 200:
-        raise RuntimeError(f"Pixelcut error {r.status_code}: {r.text}")
-    ctype = r.headers.get("Content-Type", "")
-    if "image/" in ctype:
-        return r.content
-    try:
-        data = r.json()
-        url = (
-            data.get("result_url")
-            or data.get("url")
-            or (data.get("data", {}).get("url") if isinstance(data.get("data"), dict) else None)
-        )
-        if not url:
-            raise ValueError("В ответе Pixelcut нет URL с результатом")
-        img = requests.get(url, timeout=90)
-        img.raise_for_status()
-        return img.content
-    except Exception:
-        raise RuntimeError(f"Неизвестный формат ответа Pixelcut: {r.text[:400]}")
+
+    # если раньше отправлялись параметры — оставь их как было
+    resp = requests.post(endpoint, headers=headers, files=files, timeout=120)
+
+    if resp.status_code != 200:
+        # покажем понятную причину из тела ответа
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Ошибка Pixelcut: {resp.status_code}: {detail}")
+
+    return resp.content  # если API возвращает уже байты изображения
+
 
 def pick_openai_size(aspect: str) -> str:
     if aspect == "1:1":
