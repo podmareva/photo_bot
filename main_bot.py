@@ -33,14 +33,33 @@ from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from io import BytesIO
-from PIL import Image
+import requests
 
-def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
-    """Гарантирует RGB-JPEG без альфы для сторонних API."""
-    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=95)
-    return buf.getvalue()
+def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
+    jpg = ensure_jpg_bytes(image_bytes)
+    headers = build_pixelcut_headers()
+    endpoint = os.getenv("PIXELCUT_ENDPOINT")  # оставь свой URL
+
+    def call(files: dict) -> bytes:
+        r = requests.post(endpoint, headers=headers, files=files, timeout=120)
+        if r.status_code == 200:
+            return r.content
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise RuntimeError(f"Ошибка Pixelcut: {r.status_code}: {detail}")
+
+    # 1-я попытка: поле 'image'
+    try:
+        return call({"image": ("input.jpg", BytesIO(jpg), "image/jpeg")})
+    except RuntimeError as e:
+        msg = str(e)
+        # Если формат/параметр не принят — пробуем альтернативное имя поля
+        if "Unsupported format" in msg or "invalid_parameter" in msg or "unsupported" in msg.lower():
+            return call({"image_file": ("input.jpg", BytesIO(jpg), "image/jpeg")})
+        raise
+
 
 import os
 
@@ -353,17 +372,12 @@ async def load_bytes_by_file_id(bot: Bot, file_id: str) -> bytes:
     return buf.getvalue()
 	
 def remove_bg_rembg_bytes(image_bytes: bytes) -> bytes:
-    """
-    Вырез фона через rembg с ленивым импортом и облегчённой моделью (u2netp).
-    """
     try:
         from rembg import remove, new_session
     except Exception as e:
         raise RuntimeError(f"rembg недоступен: {e}")
-
     try:
-        # u2netp заметно легче по памяти, чем u2net
-        session = new_session("u2netp")
+        session = new_session("u2netp")  # меньше RAM
         return remove(image_bytes, session=session)
     except Exception as e:
         raise RuntimeError(f"Ошибка rembg: {e}")
@@ -682,6 +696,9 @@ async def repeat_last(message: Message, state: FSMContext):
     await state.set_state(GenStates.waiting_style)
 
 # === Webhook server (единый) ===
+from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 assert BASE_URL, "WEBHOOK_BASE_URL или RENDER_EXTERNAL_URL должны быть заданы"
