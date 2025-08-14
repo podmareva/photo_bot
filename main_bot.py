@@ -35,33 +35,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from io import BytesIO
 import requests
 
-def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
-    jpg = ensure_jpg_bytes(image_bytes)
-    headers = build_pixelcut_headers()
-    endpoint = os.getenv("PIXELCUT_ENDPOINT")  # оставь свой URL
-
-    def call(files: dict) -> bytes:
-        r = requests.post(endpoint, headers=headers, files=files, timeout=120)
-        if r.status_code == 200:
-            return r.content
-        try:
-            detail = r.json()
-        except Exception:
-            detail = r.text
-        raise RuntimeError(f"Ошибка Pixelcut: {r.status_code}: {detail}")
-
-    # 1-я попытка: поле 'image'
-    try:
-        return call({"image": ("input.jpg", BytesIO(jpg), "image/jpeg")})
-    except RuntimeError as e:
-        msg = str(e)
-        # Если формат/параметр не принят — пробуем альтернативное имя поля
-        if "Unsupported format" in msg or "invalid_parameter" in msg or "unsupported" in msg.lower():
-            return call({"image_file": ("input.jpg", BytesIO(jpg), "image/jpeg")})
-        raise
-
-
-import os
+import os, requests
 
 PIXELCUT_API_KEY = os.getenv("PIXELCUT_API_KEY", "").strip()
 
@@ -377,27 +351,63 @@ def remove_bg_rembg_bytes(image_bytes: bytes) -> bytes:
     except Exception as e:
         raise RuntimeError(f"rembg недоступен: {e}")
     try:
-        session = new_session("u2netp")  # меньше RAM
+        session = new_session("u2netp")     # меньше RAM и быстрее
         return remove(image_bytes, session=session)
     except Exception as e:
         raise RuntimeError(f"Ошибка rembg: {e}")
 
+import asyncio
+
+async def remove_bg_rembg_bytes_async(image_bytes: bytes) -> bytes:
+    # переносим тяжёлую работу в поток
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, remove_bg_rembg_bytes, image_bytes)
+
+async def generate_with_rembg_or_timeout(image_bytes: bytes) -> bytes:
+    try:
+        return await asyncio.wait_for(remove_bg_rembg_bytes_async(image_bytes), timeout=40)
+    except asyncio.TimeoutError:
+        raise RuntimeError("rembg: истек таймаут 40с. Попробуйте Премиум или другое фото.")
+
+import os, requests
+
+def build_pixelcut_headers() -> dict:
+    key = os.getenv("PIXELCUT_API_KEY", "").strip()
+    if key.count(".") == 2:               # JWT: Header.Payload.Signature
+        return {"Authorization": f"Bearer {key}"}
+    return {"X-API-KEY": key}
+
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
-    jpg = ensure_jpg_bytes(image_bytes)
+    endpoint = os.getenv("PIXELCUT_ENDPOINT")
+    if not endpoint:
+        raise RuntimeError("PIXELCUT_ENDPOINT не задан")
+
     headers = build_pixelcut_headers()
+    jpg = ensure_jpg_bytes(image_bytes)
 
-    endpoint = os.getenv("PIXELCUT_ENDPOINT")  # проверь, что .env не пустой/без кавычек
-    files = {"image": ("input.jpg", BytesIO(jpg), "image/jpeg")}
-
-    r = requests.post(endpoint, headers=headers, files=files, timeout=120)
-    if r.status_code != 200:
+    def call(field_name: str) -> bytes:
+        files = {field_name: ("input.jpg", BytesIO(jpg), "image/jpeg")}
+        r = requests.post(endpoint, headers=headers, files=files, timeout=120)
+        if r.status_code == 200:
+            return r.content
         try:
             detail = r.json()
         except Exception:
             detail = r.text
         raise RuntimeError(f"Ошибка Pixelcut: {r.status_code}: {detail}")
-    return r.content
 
+    # Автоподбор имени поля файла — частая причина 400
+    for field in ("image", "image_file", "file", "file_upload"):
+        try:
+            return call(field)
+        except RuntimeError as e:
+            msg = str(e)
+            if ("Unsupported format" in msg
+                or "invalid_parameter" in msg
+                or "unsupported" in msg.lower()):
+                continue
+            raise
+    raise RuntimeError("Pixelcut: ни одно из имён полей не подошло")
 
 def pick_openai_size(aspect: str) -> str:
     if aspect == "1:1":
@@ -496,6 +506,12 @@ def seamless_place(
     center = (x + fw // 2, y + fh // 2)
     mixed = cv2.seamlessClone(canvas, back_bgr, mask_full, center, cv2.NORMAL_CLONE)
     return Image.fromarray(cv2.cvtColor(mixed, cv2.COLOR_BGR2RGB))
+
+def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
 
 # ========= handlers =========
 @router.message(CommandStart())
