@@ -196,31 +196,94 @@ def _pixelcut_headers() -> dict:
     # remove-background ожидает X-API-Key
     return {"X-API-Key": key}
 
+from io import BytesIO
+import os, logging, requests
+from PIL import Image
+
+def _validate_image_bytes(image_bytes: bytes) -> None:
+    if not isinstance(image_bytes, (bytes, bytearray)) or len(image_bytes) < 2048:
+        raise RuntimeError("Исходный файл пустой или слишком маленький (<2 КБ)")
+    try:
+        Image.open(BytesIO(image_bytes)).verify()
+    except Exception as e:
+        raise RuntimeError(f"Файл не распознан как изображение: {e}")
+
+def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
+    img = Image.open(BytesIO(image_bytes))
+    if img.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+    out = BytesIO()
+    img.save(out, format="JPEG", quality=95, optimize=True)
+    return out.getvalue()
+
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
-    endpoint = PIXELCUT_ENDPOINT.strip()
+    endpoint = os.getenv("PIXELCUT_ENDPOINT", "").strip()
+    key = os.getenv("PIXELCUT_API_KEY", "").strip()
     if not endpoint:
         raise RuntimeError("PIXELCUT_ENDPOINT не задан")
+    if not key:
+        raise RuntimeError("PIXELCUT_API_KEY не задан")
 
     _validate_image_bytes(image_bytes)
-
     jpg = ensure_jpg_bytes(image_bytes)
-    if len(jpg) < 1024:
+    if len(jpg) < 2048:
         raise RuntimeError("После конвертации в JPEG файл слишком маленький")
 
-    files = {"image": ("input.jpg", BytesIO(jpg), "image/jpeg")}  # только одно поле 'image'
-    headers = _pixelcut_headers()
+    # 1) кандидаты заголовка авторизации
+    headers_list = [
+        {"X-API-Key": key},                          # спецификация remove-background
+        {"Authorization": f"Bearer {key}"},          # встречается на некоторых тарифах
+    ]
 
-    r = requests.post(endpoint, headers=headers, files=files, timeout=120)
-    if r.status_code == 200:
-        return r.content
+    # 2) кандидаты имени поля с файлом
+    field_names = ["image", "image_file", "file", "file_upload"]
 
-    # Развёрнутый ответ для диагностики
-    try:
-        detail = r.json()
-    except Exception:
-        detail = r.text
-    logging.error("Pixelcut %s: %s", r.status_code, detail)
-    raise RuntimeError(f"Ошибка Pixelcut: {r.status_code}: {detail}")
+    last_detail = None
+    for hdr in headers_list:
+        for field in field_names:
+            files = {field: ("input.jpg", BytesIO(jpg), "image/jpeg")}
+            try:
+                logging.info("Pixelcut: пробую header=%s, field=%s, size=%d",
+                             list(hdr.keys())[0], field, len(jpg))
+                r = requests.post(endpoint, headers=hdr, files=files, timeout=120)
+
+                # успех
+                if r.status_code == 200:
+                    logging.info("Pixelcut: успех с header=%s, field=%s",
+                                 list(hdr.keys())[0], field)
+                    return r.content
+
+                # не успех — читаем деталь
+                try:
+                    detail = r.json()
+                except Exception:
+                    detail = r.text
+
+                logging.warning("Pixelcut: %s при header=%s, field=%s: %s",
+                                r.status_code, list(hdr.keys())[0], field, detail)
+
+                # если жалуется на формат/отсутствие файла/неверный параметр — пробуем дальше
+                if r.status_code == 400 and any(
+                    s in str(detail).lower()
+                    for s in ["unsupported", "missing", "invalid_parameter", "image file is missing"]
+                ):
+                    last_detail = f"{r.status_code}: {detail}"
+                    continue
+
+                # иные ошибки (401/403/5xx) — сразу отдаём наружу
+                raise RuntimeError(f"Ошибка Pixelcut: {r.status_code}: {detail}")
+
+            except requests.RequestException as e:
+                last_detail = f"network: {e}"
+                logging.error("Pixelcut network error with header=%s field=%s: %s",
+                              list(hdr.keys())[0], field, e)
+
+    raise RuntimeError(f"Ошибка Pixelcut: не удалось подобрать заголовок/поле. Последний ответ: {last_detail}")
+
 
 # ====== фон/генерация сцены ======
 
