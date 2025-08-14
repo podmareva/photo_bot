@@ -397,6 +397,85 @@ async def choose_variants(message: Message, state: FSMContext):
     )
     await message.answer(txt, reply_markup=STYLE_KB)
     await state.set_state(GenStates.waiting_style)
+from io import BytesIO
+from PIL import Image
+import os, requests, logging
+
+def _validate_image_bytes(image_bytes: bytes) -> None:
+    if not isinstance(image_bytes, (bytes, bytearray)) or len(image_bytes) < 1024:
+        raise RuntimeError("Исходный файл пустой или слишком маленький (<1 КБ)")
+    try:
+        Image.open(BytesIO(image_bytes)).verify()
+    except Exception as e:
+        raise RuntimeError(f"Файл не распознан как изображение: {e}")
+
+def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
+    """
+    Гарантированный RGB-JPEG без альфы (Pixelcut принимает JPEG/PNG).
+    Никаких EXIF/ICC — максимально простой JPEG.
+    """
+    img = Image.open(BytesIO(image_bytes))
+    if img.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+    out = BytesIO()
+    img.save(out, format="JPEG", quality=95, optimize=True)
+    return out.getvalue()
+
+def _pixelcut_headers() -> dict:
+    key = os.getenv("PIXELCUT_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("PIXELCUT_API_KEY не задан")
+    # Для /v1/remove-background корректный заголовок — X-API-Key
+    return {"X-API-Key": key}
+
+def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
+    """
+    Премиум: шлём multipart с файлом. Перебираем возможные имена поля:
+    'image' → 'image_file' → 'file' → 'file_upload'.
+    Это закрывает 400 'Unsupported format'/'invalid_parameter' на отдельных аккаунтах/путях.
+    """
+    endpoint = os.getenv("PIXELCUT_ENDPOINT", "").strip()
+    if not endpoint:
+        raise RuntimeError("PIXELCUT_ENDPOINT не задан")
+
+    _validate_image_bytes(image_bytes)
+    jpg = ensure_jpg_bytes(image_bytes)
+    if len(jpg) < 1024:
+        raise RuntimeError("После конвертации в JPEG файл слишком маленький")
+
+    headers = _pixelcut_headers()
+
+    def _call(field: str) -> bytes:
+        # ВАЖНО: одно поле с типом image/jpeg; Content-Type формирует requests
+        files = {field: ("input.jpg", BytesIO(jpg), "image/jpeg")}
+        r = requests.post(endpoint, headers=headers, files=files, timeout=120)
+        if r.status_code == 200:
+            return r.content
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise RuntimeError(f"{r.status_code}: {detail}")
+
+    last_err = None
+    for field in ("image", "image_file", "file", "file_upload"):
+        try:
+            return _call(field)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            # Если жалуется на формат/параметр — пробуем следующее имя
+            if "unsupported" in msg or "invalid_parameter" in msg or "missing" in msg:
+                last_err = e
+                continue
+            # Иные ошибки (401/403/5xx) — пробрасываем сразу
+            raise RuntimeError(f"Ошибка Pixelcut: {e}")
+
+    # Если все варианты не зашли — отдадим последнюю понятную причину
+    raise RuntimeError(f"Ошибка Pixelcut: {last_err}")
 
 @router.message(GenStates.waiting_style, F.text)
 async def generate_result(message: Message, state: FSMContext):
