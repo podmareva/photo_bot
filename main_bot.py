@@ -1,11 +1,3 @@
-try:
-    import rembg  # noqa
-    print("rembg: OK")
-except Exception as e:
-    print("rembg import failed:", repr(e))
-
-from __future__ import annotations
-
 import os
 import io
 import base64
@@ -724,3 +716,4 @@ setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_ap
 if __name__ == "__main__":
     logging.info("Server starting on %s:%s", WEBAPP_HOST, WEBAPP_PORT)
     web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+
