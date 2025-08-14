@@ -42,6 +42,20 @@ def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
     img.save(buf, format="JPEG", quality=95)
     return buf.getvalue()
 
+import os
+
+PIXELCUT_API_KEY = os.getenv("PIXELCUT_API_KEY", "").strip()
+
+def build_pixelcut_headers() -> dict:
+    """
+    Если ключ похож на JWT (три части через точки) — шлём как Bearer.
+    Иначе используем X-API-KEY.
+    """
+    if PIXELCUT_API_KEY.count(".") == 2:  # Header.Payload.Signature
+        return {"Authorization": f"Bearer {PIXELCUT_API_KEY}"}
+    else:
+        return {"X-API-KEY": PIXELCUT_API_KEY}
+
 # === OPTIONAL local free remover ===
 try:
     from rembg import remove as rembg_remove
@@ -374,7 +388,7 @@ def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     endpoint = os.getenv("PIXELCUT_ENDPOINT")  # например: "https://api.pixelcut.ai/v1/remove-background"
     api_key = os.getenv("PIXELCUT_API_KEY")
 
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    headers = build_pixelcut_headers()
 
     files = {
         # ключ 'image' — наиболее типичный; если у тебя другой — оставь как в твоём коде
@@ -716,4 +730,3 @@ setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_ap
 if __name__ == "__main__":
     logging.info("Server starting on %s:%s", WEBAPP_HOST, WEBAPP_PORT)
     web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
-
