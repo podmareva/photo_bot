@@ -377,6 +377,12 @@ def build_pixelcut_headers() -> dict:
         return {"Authorization": f"Bearer {key}"}
     return {"X-API-KEY": key}
 
+def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+    
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     endpoint = os.getenv("PIXELCUT_ENDPOINT")
     if not endpoint:
@@ -507,12 +513,6 @@ def seamless_place(
     mixed = cv2.seamlessClone(canvas, back_bgr, mask_full, center, cv2.NORMAL_CLONE)
     return Image.fromarray(cv2.cvtColor(mixed, cv2.COLOR_BGR2RGB))
 
-def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
-    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=95)
-    return buf.getvalue()
-
 # ========= handlers =========
 @router.message(CommandStart())
 async def on_start(message: Message, state: FSMContext):
@@ -625,7 +625,8 @@ async def generate_result(message: Message, state: FSMContext):
         if cut_service == CutService.PIXELCUT.value:
             cut_png = remove_bg_pixelcut(image_bytes)
         else:
-            cut_png = remove_bg_rembg_bytes(image_bytes)
+            cut_png = await generate_with_rembg_or_timeout(image_bytes)
+
 
         result_file_ids: List[str] = []
 
@@ -732,4 +733,5 @@ SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
 setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_app)
 
 if __name__ == "__main__":
+    # ВАЖНО: слушаем порт от Render
     web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
