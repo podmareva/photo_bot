@@ -41,23 +41,23 @@ try:
 except Exception:
     REMBG_AVAILABLE = False
 
-# ====== CONFIG ======
+# ========= ENV / CONFIG =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PIXELCUT_API_KEY = os.getenv("PIXELCUT_API_KEY")
 PIXELCUT_ENDPOINT = os.getenv(
     "PIXELCUT_ENDPOINT", "https://api.developer.pixelcut.ai/v1/remove-background"
 )
-
-# опционально
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 MAIN_BOT_USERNAME = os.getenv("MAIN_BOT_USERNAME", "")
 
-# ====== DB helpers (галерея хранит только метаданные и file_id) ======
+assert BOT_TOKEN, "BOT_TOKEN is required"
+
+# === OPTIONAL PG (сохраняем только метаданные/file_id) ===
 import psycopg2
 
-def db_exec(q, params=()):
+def db_exec(q: str, params: tuple = ()):  # очень простой helper
     if not DATABASE_URL:
         return None
     conn = psycopg2.connect(DATABASE_URL)
@@ -77,7 +77,7 @@ def gallery_save(
     size_aspect: str,
     style_text: str,
     n_variants: int,
-    result_file_ids: list,
+    result_file_ids: List[str],
 ):
     if not DATABASE_URL:
         return
@@ -106,39 +106,29 @@ def gallery_last(user_id: int):
     )
     return rows[0] if rows else None
 
-assert BOT_TOKEN, "BOT_TOKEN is required"
-assert OPENAI_API_KEY, "OPENAI_API_KEY is required"
+# ========= logging =========
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
-logging.basicConfig(level=logging.INFO)
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot, storage=MemoryStorage())
-
-import os as _os, logging as _logging
-_logging.info("Bot starting… PID=%s, instance=%s",
-             _os.getpid(), _os.getenv("RENDER_INSTANCE_ID"))
+bot = Bot(BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+router = Router()
+dp.include_router(router)
 
 async def _log_bot_info():
     me = await bot.get_me()
-    logging.info("Bot: @%s (id=%s)", me.username, me.id)
+    logging.info("Bot: @%s (%s)", me.username, me.id)
 
-# ===== TEXTS =====
+# ========= texts =========
 WELCOME = (
     "👋 Привет! Ты в боте «Предметный фотограф».\n\n"
-    "Он поможет:\n"
-    "• сделать качественные предметные фото,\n"
-    "• заменить фон без потери формы, цвета и надписей,\n"
-    "• создать атмосферные сцены (студийно / на человеке / в руках).\n\n"
-    "🔐 Чтобы начать, нажми «СТАРТ»."
+    "Он поможет: сделать предметные фото, заменить фон, создать сцены.\n\n"
+    "Нажми «СТАРТ», чтобы начать."
 )
 
 REQUIREMENTS = (
-    "📥 Добавь своё фото.\n\n"
-    "Требования к исходнику для лучшего результата:\n"
-    "• Ровный свет без жёстких теней.\n"
-    "• Нейтральный однотонный фон.\n"
-    "• Предмет целиком, края не обрезаны.\n"
-    "• Максимальное качество (лучше «Документ», чтобы Telegram не сжимал)."
+    "📥 Пришли фото товара.\n\n"
+    "Советы: ровный свет, однотонный фон, лучше отправить как Документ (без сжатия)."
 )
 
 PROMPTS_FILE = Path(__file__).parent / "prompts_cheatsheet.md"
@@ -237,17 +227,17 @@ PROMPTS_MD = """# 📓 Шпаргалка по промптам для гене�
 - no props, no text
 """
 
-# ====== STATES ======
+# ========= states =========
 class GenStates(StatesGroup):
     waiting_start = State()
     waiting_photo = State()
     waiting_service = State()
-    waiting_placement = State()  # студия / на человеке / в руках (автоген)
-    waiting_size = State()       # выбор соотношения сторон
-    waiting_variants = State()   # сколько вариантов
+    waiting_placement = State()
+    waiting_size = State()
+    waiting_variants = State()
     waiting_style = State()
 
-# ====== CHOICES & KEYBOARDS ======
+# ========= choices/keyboards =========
 class CutService(str, Enum):
     REMBG = "Эконом (RemBG — бесплатно)"
     PIXELCUT = "Премиум (Pixelcut — лучше качество)"
@@ -257,36 +247,35 @@ class Placement(str, Enum):
     ON_BODY = "На человеке (украшение/одежда)"
     IN_HAND = "В руках (крупный план)"
 
-start_kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-start_kb.add(types.KeyboardButton("СТАРТ"))
-start_kb.add(types.KeyboardButton("📓 Шпаргалка по промтам"))
+# Кнопка СТАРТ + шпаргалка
+start_kb = ReplyKeyboardBuilder()
+start_kb.button(text="СТАРТ")
+start_kb.button(text="📓 Шпаргалка по промтам")
+start_kb.adjust(2)
+START_KB = start_kb.as_markup(resize_keyboard=True)
 
-CUT_KB = types.ReplyKeyboardMarkup(resize_keyboard=True)
-CUT_KB.add(CutService.REMBG.value)
-CUT_KB.add(CutService.PIXELCUT.value)
+# выбор сервиса вырезки
+cut_kb = ReplyKeyboardBuilder()
+cut_kb.button(text=CutService.REMBG.value)
+cut_kb.button(text=CutService.PIXELCUT.value)
+cut_kb.adjust(1)
+CUT_KB = cut_kb.as_markup(resize_keyboard=True)
 
-PLACEMENT_KB = types.ReplyKeyboardMarkup(resize_keyboard=True)
-PLACEMENT_KB.add(Placement.STUDIO.value)
-PLACEMENT_KB.add(Placement.ON_BODY.value)
-PLACEMENT_KB.add(Placement.IN_HAND.value)
+# расположение
+place_kb = ReplyKeyboardBuilder()
+for p in (Placement.STUDIO.value, Placement.ON_BODY.value, Placement.IN_HAND.value):
+    place_kb.button(text=p)
+place_kb.adjust(1)
+PLACEMENT_KB = place_kb.as_markup(resize_keyboard=True)
 
+# пресеты стиля
 PRESETS = [
-    "Каталог: чистый студийный фон, мягкий градиент, аккуратная тень",
-    "Минимализм: однотонный матовый фон, мягкие тени",
-    "Светлый монохром: high-key, ровный дневной свет",
-    "Тёмный монохром: low-key, глубокие тени, контровый свет",
-    "Luxury: глянцевый камень/мрамор, контролируемые блики",
-    "Nature-mood: дерево, лен, зелень, рассеянный свет",
-    "Flat lay: вид сверху, минимальные пропсы",
-    "Косметика: матовый акрил, стекло, мягкие отражения",
-    "Украшения: бархат, макро-свет, контролируемые блики",
-    "Еда/выпечка: деревянный стол, тёплый утренний свет",
-    "Техника: бетон/алюминий, холодный свет, геометрия",
-    "Праздничный: нейтральный фон, тёплое боке огней",
-    "Лето/аутдор: тёплый солнечный свет, тени листвы",
-    "Камень/мрамор: полированный мрамор, мягкие блики",
-    "Бетон: гладкий серый бетон, графичные тени",
-    "Лён/текстиль: мягкие складки, дневной свет",
+    "Каталог: чистый студийный фон, мягкая тень",
+    "Минимализм: однотон, мягкие тени",
+    "Тёмный премиум: low-key, контровый свет",
+    "Мрамор/глянец: контролируемые блики",
+    "Nature: дерево/лен/зелень, дневной свет",
+    "Flat lay: вид сверху, минимум пропсов",
 ]
 style_kb_builder = ReplyKeyboardBuilder()
 for p in PRESETS:
@@ -311,17 +300,15 @@ VAR_KB = var_kb.as_markup(resize_keyboard=True)
 # ========= helpers =========
 OPENAI_IMAGES_ENDPOINT = "https://api.openai.com/v1/images/generations"
 
-# ===== ACCESS =====
 def ensure_prompts_file():
     if not PROMPTS_FILE.exists():
         PROMPTS_FILE.write_text(PROMPTS_MD, encoding="utf-8")
-        
-def check_user_access(user_id: int) -> bool:
+
+async def check_user_access(user_id: int) -> bool:
     if ADMIN_ID and user_id == ADMIN_ID:
         return True
-    return True  # для тестов пускаем всех
+    return True  # пускаем всех
 
-# ====== HELPERS ======
 async def download_bytes_from_message(bot: Bot, message: Message) -> tuple[bytes, str]:
     """Скачать байты файла из сообщения + вернуть file_id для галереи."""
     if message.document:
