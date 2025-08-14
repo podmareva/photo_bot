@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import io
 import base64
@@ -5,46 +7,57 @@ import logging
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from typing import Optional, List
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import requests
 from PIL import Image, ImageFilter
-from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.utils.executor import start_webhook
+import numpy as np
+import cv2
 
-# == OPTIONAL local free remover ==
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message,
+    FSInputFile,
+    BufferedInputFile,
+)
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.filters import CommandStart
+from aiogram import Router
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+
+# webhook + aiohttp server
+from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
+# === OPTIONAL local free remover ===
 try:
     from rembg import remove as rembg_remove
     REMBG_AVAILABLE = True
 except Exception:
     REMBG_AVAILABLE = False
 
-# == OpenCV для мягкого вписывания ==
-import numpy as np
-import cv2
-
-# ====== CONFIG ======
+# ========= ENV / CONFIG =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PIXELCUT_API_KEY = os.getenv("PIXELCUT_API_KEY")
 PIXELCUT_ENDPOINT = os.getenv(
     "PIXELCUT_ENDPOINT", "https://api.developer.pixelcut.ai/v1/remove-background"
 )
-
-# опционально
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 MAIN_BOT_USERNAME = os.getenv("MAIN_BOT_USERNAME", "")
 
-# ====== DB helpers (галерея хранит только метаданные и file_id) ======
+assert BOT_TOKEN, "BOT_TOKEN is required"
+
+# === OPTIONAL PG (сохраняем только метаданные/file_id) ===
 import psycopg2
 
-def db_exec(q, params=()):
+def db_exec(q: str, params: tuple = ()):  # очень простой helper
     if not DATABASE_URL:
         return None
     conn = psycopg2.connect(DATABASE_URL)
@@ -64,7 +77,7 @@ def gallery_save(
     size_aspect: str,
     style_text: str,
     n_variants: int,
-    result_file_ids: list,
+    result_file_ids: List[str],
 ):
     if not DATABASE_URL:
         return
@@ -93,39 +106,29 @@ def gallery_last(user_id: int):
     )
     return rows[0] if rows else None
 
-assert BOT_TOKEN, "BOT_TOKEN is required"
-assert OPENAI_API_KEY, "OPENAI_API_KEY is required"
+# ========= logging =========
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
-logging.basicConfig(level=logging.INFO)
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot, storage=MemoryStorage())
-
-import os as _os, logging as _logging
-_logging.info("Bot starting… PID=%s, instance=%s",
-             _os.getpid(), _os.getenv("RENDER_INSTANCE_ID"))
+bot = Bot(BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+router = Router()
+dp.include_router(router)
 
 async def _log_bot_info():
     me = await bot.get_me()
-    logging.info("Bot: @%s (id=%s)", me.username, me.id)
+    logging.info("Bot: @%s (%s)", me.username, me.id)
 
-# ===== TEXTS =====
+# ========= texts =========
 WELCOME = (
     "👋 Привет! Ты в боте «Предметный фотограф».\n\n"
-    "Он поможет:\n"
-    "• сделать качественные предметные фото,\n"
-    "• заменить фон без потери формы, цвета и надписей,\n"
-    "• создать атмосферные сцены (студийно / на человеке / в руках).\n\n"
-    "🔐 Чтобы начать, нажми «СТАРТ»."
+    "Он поможет: сделать предметные фото, заменить фон, создать сцены.\n\n"
+    "Нажми «СТАРТ», чтобы начать."
 )
 
 REQUIREMENTS = (
-    "📥 Добавь своё фото.\n\n"
-    "Требования к исходнику для лучшего результата:\n"
-    "• Ровный свет без жёстких теней.\n"
-    "• Нейтральный однотонный фон.\n"
-    "• Предмет целиком, края не обрезаны.\n"
-    "• Максимальное качество (лучше «Документ», чтобы Telegram не сжимал)."
+    "📥 Пришли фото товара.\n\n"
+    "Советы: ровный свет, однотонный фон, лучше отправить как Документ (без сжатия)."
 )
 
 PROMPTS_FILE = Path(__file__).parent / "prompts_cheatsheet.md"
@@ -224,17 +227,17 @@ PROMPTS_MD = """# 📓 Шпаргалка по промптам для гене�
 - no props, no text
 """
 
-# ====== STATES ======
+# ========= states =========
 class GenStates(StatesGroup):
     waiting_start = State()
     waiting_photo = State()
     waiting_service = State()
-    waiting_placement = State()  # студия / на человеке / в руках (автоген)
-    waiting_size = State()       # выбор соотношения сторон
-    waiting_variants = State()   # сколько вариантов
+    waiting_placement = State()
+    waiting_size = State()
+    waiting_variants = State()
     waiting_style = State()
 
-# ====== CHOICES & KEYBOARDS ======
+# ========= choices/keyboards =========
 class CutService(str, Enum):
     REMBG = "Эконом (RemBG — бесплатно)"
     PIXELCUT = "Премиум (Pixelcut — лучше качество)"
@@ -244,72 +247,91 @@ class Placement(str, Enum):
     ON_BODY = "На человеке (украшение/одежда)"
     IN_HAND = "В руках (крупный план)"
 
-start_kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-start_kb.add(types.KeyboardButton("СТАРТ"))
-start_kb.add(types.KeyboardButton("📓 Шпаргалка по промтам"))
+# Кнопка СТАРТ + шпаргалка
+start_kb = ReplyKeyboardBuilder()
+start_kb.button(text="СТАРТ")
+start_kb.button(text="📓 Шпаргалка по промтам")
+start_kb.adjust(2)
+START_KB = start_kb.as_markup(resize_keyboard=True)
 
-CUT_KB = types.ReplyKeyboardMarkup(resize_keyboard=True)
-CUT_KB.add(CutService.REMBG.value)
-CUT_KB.add(CutService.PIXELCUT.value)
+# выбор сервиса вырезки
+cut_kb = ReplyKeyboardBuilder()
+cut_kb.button(text=CutService.REMBG.value)
+cut_kb.button(text=CutService.PIXELCUT.value)
+cut_kb.adjust(1)
+CUT_KB = cut_kb.as_markup(resize_keyboard=True)
 
-PLACEMENT_KB = types.ReplyKeyboardMarkup(resize_keyboard=True)
-PLACEMENT_KB.add(Placement.STUDIO.value)
-PLACEMENT_KB.add(Placement.ON_BODY.value)
-PLACEMENT_KB.add(Placement.IN_HAND.value)
+# расположение
+place_kb = ReplyKeyboardBuilder()
+for p in (Placement.STUDIO.value, Placement.ON_BODY.value, Placement.IN_HAND.value):
+    place_kb.button(text=p)
+place_kb.adjust(1)
+PLACEMENT_KB = place_kb.as_markup(resize_keyboard=True)
 
+# пресеты стиля
 PRESETS = [
-    "Каталог: чистый студийный фон, мягкий градиент, аккуратная тень",
-    "Минимализм: однотонный матовый фон, мягкие тени",
-    "Светлый монохром: high-key, ровный дневной свет",
-    "Тёмный монохром: low-key, глубокие тени, контровый свет",
-    "Luxury: глянцевый камень/мрамор, контролируемые блики",
-    "Nature-mood: дерево, лен, зелень, рассеянный свет",
-    "Flat lay: вид сверху, минимальные пропсы",
-    "Косметика: матовый акрил, стекло, мягкие отражения",
-    "Украшения: бархат, макро-свет, контролируемые блики",
-    "Еда/выпечка: деревянный стол, тёплый утренний свет",
-    "Техника: бетон/алюминий, холодный свет, геометрия",
-    "Праздничный: нейтральный фон, тёплое боке огней",
-    "Лето/аутдор: тёплый солнечный свет, тени листвы",
-    "Камень/мрамор: полированный мрамор, мягкие блики",
-    "Бетон: гладкий серый бетон, графичные тени",
-    "Лён/текстиль: мягкие складки, дневной свет",
+    "Каталог: чистый студийный фон, мягкая тень",
+    "Минимализм: однотон, мягкие тени",
+    "Тёмный премиум: low-key, контровый свет",
+    "Мрамор/глянец: контролируемые блики",
+    "Nature: дерево/лен/зелень, дневной свет",
+    "Flat lay: вид сверху, минимум пропсов",
 ]
-STYLE_KB = types.ReplyKeyboardMarkup(resize_keyboard=True)
+style_kb_builder = ReplyKeyboardBuilder()
 for p in PRESETS:
-    STYLE_KB.add(types.KeyboardButton(p))
-STYLE_KB.add(types.KeyboardButton("Своя сцена (опишу текстом)"))
+    style_kb_builder.button(text=p)
+style_kb_builder.button(text="Своя сцена (опишу текстом)")
+style_kb_builder.adjust(1)
+STYLE_KB = style_kb_builder.as_markup(resize_keyboard=True)
 
+# размеры и количество
+size_kb = ReplyKeyboardBuilder()
+for s in ("1:1", "4:5", "3:4", "16:9", "9:16"):
+    size_kb.button(text=s)
+size_kb.adjust(3, 2)
+SIZE_KB = size_kb.as_markup(resize_keyboard=True)
+
+var_kb = ReplyKeyboardBuilder()
+for n in ("1", "2", "3", "4", "5"):
+    var_kb.button(text=n)
+var_kb.adjust(5)
+VAR_KB = var_kb.as_markup(resize_keyboard=True)
+
+# ========= helpers =========
 OPENAI_IMAGES_ENDPOINT = "https://api.openai.com/v1/images/generations"
-
-SIZE_KB = types.ReplyKeyboardMarkup(resize_keyboard=True)
-for s in ["1:1", "4:5", "3:4", "16:9", "9:16"]:
-    SIZE_KB.add(types.KeyboardButton(s))
-
-VAR_KB = types.ReplyKeyboardMarkup(resize_keyboard=True)
-for n in ["1", "2", "3", "4", "5"]:
-    VAR_KB.add(types.KeyboardButton(n))
-
-# ===== ACCESS =====
-def check_user_access(user_id: int) -> bool:
-    if ADMIN_ID and user_id == ADMIN_ID:
-        return True
-    return True  # для тестов пускаем всех
-
-# ====== HELPERS ======
-async def load_bytes_by_file_id(bot: Bot, file_id: str) -> bytes:
-    """Скачать байты исходника по Telegram file_id (нужно для /repeat)."""
-    f = await bot.get_file(file_id)
-    fb = await bot.download_file(f.file_path)
-    return fb.read()
 
 def ensure_prompts_file():
     if not PROMPTS_FILE.exists():
         PROMPTS_FILE.write_text(PROMPTS_MD, encoding="utf-8")
 
-def remove_bg_rembg(image_bytes: bytes) -> bytes:
+async def check_user_access(user_id: int) -> bool:
+    if ADMIN_ID and user_id == ADMIN_ID:
+        return True
+    return True  # пускаем всех
+
+async def download_bytes_from_message(bot: Bot, message: Message) -> tuple[bytes, str]:
+    """Скачать байты файла из сообщения + вернуть file_id для галереи."""
+    if message.document:
+        file_id = message.document.file_id
+        buf = io.BytesIO()
+        await bot.download(message.document, destination=buf)
+        return buf.getvalue(), file_id
+    elif message.photo:
+        file_id = message.photo[-1].file_id
+        buf = io.BytesIO()
+        await bot.download(message.photo[-1], destination=buf)
+        return buf.getvalue(), file_id
+    else:
+        raise ValueError("В сообщении нет фото/документа")
+
+async def load_bytes_by_file_id(bot: Bot, file_id: str) -> bytes:
+    buf = io.BytesIO()
+    await bot.download(file_id, destination=buf)
+    return buf.getvalue()
+
+def remove_bg_rembg_bytes(image_bytes: bytes) -> bytes:
     if not REMBG_AVAILABLE:
-        raise RuntimeError("rembg не установлен. Установи: pip install rembg")
+        raise RuntimeError("rembg не установлен (pip install rembg)")
     return rembg_remove(
         image_bytes,
         alpha_matting=True,
@@ -319,42 +341,41 @@ def remove_bg_rembg(image_bytes: bytes) -> bytes:
     )
 
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
-    if not PIXELCUT_API_KEY or not PIXELCUT_ENDPOINT:
-        raise RuntimeError("Не задан PIXELCUT_API_KEY или PIXELCUT_ENDPOINT")
+    if not PIXELCUT_API_KEY:
+        raise RuntimeError("PIXELCUT_API_KEY не задан")
     headers = {"X-API-KEY": PIXELCUT_API_KEY}
     files = {
         "image": ("image.png", image_bytes, "image/png"),
         "image_file": ("image.png", image_bytes, "image/png"),
     }
-    resp = requests.post(PIXELCUT_ENDPOINT, headers=headers, files=files, timeout=90)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Pixelcut error {resp.status_code}: {resp.text}")
-    ctype = resp.headers.get("Content-Type", "")
-    if "image/" in ctype or resp.content.startswith(b"\x89PNG") or resp.content.startswith(b"\xff\xd8"):
-        return resp.content
+    r = requests.post(PIXELCUT_ENDPOINT, headers=headers, files=files, timeout=90)
+    if r.status_code != 200:
+        raise RuntimeError(f"Pixelcut error {r.status_code}: {r.text}")
+    ctype = r.headers.get("Content-Type", "")
+    if "image/" in ctype:
+        return r.content
     try:
-        data = resp.json()
+        data = r.json()
         url = (
             data.get("result_url")
             or data.get("url")
             or (data.get("data", {}).get("url") if isinstance(data.get("data"), dict) else None)
         )
         if not url:
-            raise ValueError("Не найдено поле result_url/url в ответе Pixelcut")
+            raise ValueError("В ответе Pixelcut нет URL с результатом")
         img = requests.get(url, timeout=90)
         img.raise_for_status()
         return img.content
     except Exception:
-        raise RuntimeError(f"Неизвестный формат ответа Pixelcut: {resp.text[:400]}")
+        raise RuntimeError(f"Неизвестный формат ответа Pixelcut: {r.text[:400]}")
 
 def pick_openai_size(aspect: str) -> str:
-    # gpt-image-1: 1024x1024, 1024x1792 (портрет ~9:16), 1792x1024 (ландшафт ~16:9)
     if aspect == "1:1":
         return "1024x1024"
     if aspect in ("4:5", "3:4", "9:16"):
-        return "1024x1792"   # портрет
+        return "1024x1792"
     if aspect == "16:9":
-        return "1792x1024"   # горизонталь
+        return "1792x1024"
     return "1024x1024"
 
 def center_crop_to_aspect(img: Image.Image, aspect: str) -> Image.Image:
@@ -376,6 +397,7 @@ def center_crop_to_aspect(img: Image.Image, aspect: str) -> Image.Image:
         return img.crop((0, y1, w, y1 + new_h))
 
 def generate_background(prompt: str, size: str = "1024x1024") -> Image.Image:
+    assert OPENAI_API_KEY, "OPENAI_API_KEY is required"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "gpt-image-1",
@@ -401,25 +423,18 @@ def compose_subject_on_bg(
     x_shift: float = 0.0,
     y_shift: float = -0.05,
 ) -> Image.Image:
-    """Простая компоновка + мягкая тень (без cv2)."""
     subj = Image.open(io.BytesIO(subject_png)).convert("RGBA")
     canvas_w, canvas_h = bg_img.size
     target_h = int(canvas_h * scale_by_height)
     scale = target_h / max(1, subj.height)
-    subj = subj.resize(
-        (max(1, int(subj.width * scale)), max(1, int(subj.height * scale))),
-        Image.LANCZOS,
-    )
-
+    subj = subj.resize((max(1, int(subj.width * scale)), max(1, int(subj.height * scale))), Image.LANCZOS)
     alpha = subj.split()[-1]
     shadow = Image.new("RGBA", subj.size, (0, 0, 0, 160))
     shadow.putalpha(alpha)
     shadow = shadow.filter(ImageFilter.GaussianBlur(12))
-
     out = bg_img.copy()
     x = int((canvas_w - subj.width) * 0.5 + x_shift * canvas_w)
     y = int(canvas_h - subj.height + y_shift * canvas_h)
-
     out.alpha_composite(shadow, (x + 8, y + 18))
     out.alpha_composite(subj, (x, y))
     return out
@@ -432,122 +447,94 @@ def seamless_place(
     x: int,
     y: int,
 ) -> Image.Image:
-    """
-    Мягко «вживляет» вырезанный предмет в фон (cv2.seamlessClone).
-    x, y — позиция левого-верхнего угла прямоугольника вставки (центр будет рассчитан).
-    """
     fore = Image.open(io.BytesIO(subject_png)).convert("RGBA")
     back = back_img.convert("RGB")
-
     bw, bh = back.size
     target_h = int(bh * scale_by_height)
     ratio = target_h / max(1, fore.height)
     fore = fore.resize((max(1, int(fore.width * ratio)), target_h), Image.LANCZOS)
-
     fore_rgb = cv2.cvtColor(np.array(fore.convert("RGB")), cv2.COLOR_RGB2BGR)
     back_bgr = cv2.cvtColor(np.array(back), cv2.COLOR_RGB2BGR)
     mask = np.array(fore.split()[-1])
-
     fh, fw = fore_rgb.shape[:2]
     x = max(0, min(back_bgr.shape[1] - fw, x))
     y = max(0, min(back_bgr.shape[0] - fh, y))
-
     canvas = np.zeros_like(back_bgr)
     canvas[y:y+fh, x:x+fw] = fore_rgb
-
     mask_full = np.zeros(back_bgr.shape[:2], dtype=np.uint8)
     mask_full[y:y+fh, x:x+fw] = mask
-
     center = (x + fw // 2, y + fh // 2)
     mixed = cv2.seamlessClone(canvas, back_bgr, mask_full, center, cv2.NORMAL_CLONE)
     return Image.fromarray(cv2.cvtColor(mixed, cv2.COLOR_BGR2RGB))
 
-# ====== BOT HANDLERS ======
-@dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message, state: FSMContext):
-    if not check_user_access(message.from_user.id):
+# ========= handlers =========
+@router.message(CommandStart())
+async def on_start(message: Message, state: FSMContext):
+    if not await check_user_access(message.from_user.id):
         await message.answer(f"⛔ Нет доступа. Получите доступ через @{MAIN_BOT_USERNAME}.")
         return
-    await state.finish()
+    await state.clear()
     ensure_prompts_file()
-    await message.answer(WELCOME, reply_markup=start_kb)
-    await GenStates.waiting_start.set()
+    await message.answer(WELCOME, reply_markup=START_KB)
+    await state.set_state(GenStates.waiting_start)
 
-@dp.message_handler(lambda m: (m.text or "").strip().upper() == "СТАРТ", state=GenStates.waiting_start)
-async def on_press_start(message: types.Message, state: FSMContext):
-    await message.answer(REQUIREMENTS, reply_markup=types.ReplyKeyboardRemove())
+@router.message(GenStates.waiting_start, F.text == "📓 Шпаргалка по промтам")
+async def send_cheatsheet(message: Message, state: FSMContext):
+    ensure_prompts_file()
     try:
-        with open(PROMPTS_FILE, "rb") as f:
-            await message.answer_document(
-                types.InputFile(f, filename=PROMPTS_FILE.name),
-                caption="📓 Шпаргалка по промптам",
-            )
-    except FileNotFoundError:
-        await message.answer("⚠️ Шпаргалка пока недоступна.")
+        await message.answer_document(FSInputFile(PROMPTS_FILE))
+    except Exception:
+        await message.answer("⚠️ Файл со шпаргалкой пока недоступен.")
+
+@router.message(GenStates.waiting_start, F.text.casefold() == "старт")
+async def pressed_start(message: Message, state: FSMContext):
+    await message.answer(REQUIREMENTS)
+    try:
+        await message.answer_document(FSInputFile(PROMPTS_FILE), caption="📓 Шпаргалка по промптам")
+    except Exception:
+        pass
     await message.answer("Пришли фото товара (лучше как Документ).")
-    await GenStates.waiting_photo.set()
+    await state.set_state(GenStates.waiting_photo)
 
-@dp.message_handler(state=GenStates.waiting_start, regexp="^📓 Шпаргалка по промтам$")
-async def send_cheatsheet(message: types.Message, state: FSMContext):
-    ensure_prompts_file()
-    try:
-        with open(PROMPTS_FILE, "rb") as f:
-            await message.answer_document(
-                types.InputFile(f, filename=PROMPTS_FILE.name),
-                caption="📓 Шпаргалка по промптам",
-            )
-    except FileNotFoundError:
-        await message.answer("⚠️ Файл со шпаргалкой не найден.")
-
-@dp.message_handler(state=GenStates.waiting_photo, content_types=["photo", "document"])
-async def got_photo(message: types.Message, state: FSMContext):
-    # Получаем file_id для галереи и байты для вырезки
-    if message.document:
-        src_file_id = message.document.file_id
-        f = await bot.get_file(message.document.file_id)
-    else:
-        src_file_id = message.photo[-1].file_id
-        f = await bot.get_file(message.photo[-1].file_id)
-    fb = await bot.download_file(f.file_path)
-    await state.update_data(image=fb.read(), image_file_id=src_file_id)
-
+@router.message(GenStates.waiting_photo, F.document | F.photo)
+async def got_photo(message: Message, state: FSMContext):
+    image_bytes, file_id = await download_bytes_from_message(bot, message)
+    await state.update_data(image=image_bytes, image_file_id=file_id)
     await message.answer("Чем вырезать фон?", reply_markup=CUT_KB)
-    await GenStates.waiting_service.set()
+    await state.set_state(GenStates.waiting_service)
 
-@dp.message_handler(state=GenStates.waiting_service, content_types=["text"])
-async def choose_service(message: types.Message, state: FSMContext):
+@router.message(GenStates.waiting_service, F.text)
+async def choose_service(message: Message, state: FSMContext):
     choice = (message.text or "").strip()
     if choice not in (CutService.REMBG.value, CutService.PIXELCUT.value):
         await message.answer("Выбери вариант на клавиатуре.")
         return
     await state.update_data(cut_service=choice)
-
     await message.answer("Выбери расположение товара:", reply_markup=PLACEMENT_KB)
-    await GenStates.waiting_placement.set()
+    await state.set_state(GenStates.waiting_placement)
 
-@dp.message_handler(state=GenStates.waiting_placement, content_types=["text"])
-async def choose_placement(message: types.Message, state: FSMContext):
+@router.message(GenStates.waiting_placement, F.text)
+async def choose_placement(message: Message, state: FSMContext):
     val = (message.text or "").strip()
     if val not in (Placement.STUDIO.value, Placement.ON_BODY.value, Placement.IN_HAND.value):
         await message.answer("Выбери один из вариантов.")
         return
     await state.update_data(placement=val)
-
     await message.answer("Выбери размер (соотношение сторон):", reply_markup=SIZE_KB)
-    await GenStates.waiting_size.set()
+    await state.set_state(GenStates.waiting_size)
 
-@dp.message_handler(state=GenStates.waiting_size, content_types=["text"])
-async def choose_size(message: types.Message, state: FSMContext):
+@router.message(GenStates.waiting_size, F.text)
+async def choose_size(message: Message, state: FSMContext):
     size = (message.text or "").strip()
     if size not in {"1:1", "4:5", "3:4", "16:9", "9:16"}:
         await message.answer("Выбери один из вариантов на клавиатуре.")
         return
     await state.update_data(size_aspect=size)
     await message.answer("Сколько вариантов сделать за один раз?", reply_markup=VAR_KB)
-    await GenStates.waiting_variants.set()
+    await state.set_state(GenStates.waiting_variants)
 
-@dp.message_handler(state=GenStates.waiting_variants, content_types=["text"])
-async def choose_variants(message: types.Message, state: FSMContext):
+@router.message(GenStates.waiting_variants, F.text)
+async def choose_variants(message: Message, state: FSMContext):
     try:
         n = int((message.text or "1").strip())
     except ValueError:
@@ -556,47 +543,45 @@ async def choose_variants(message: types.Message, state: FSMContext):
     await state.update_data(n_variants=n)
     txt = (
         "Выбери сцену или опиши свою.\n\n"
-        "Подсказки по промптам:\n"
-        "• Каталог — clean studio background, soft gradient, subtle shadow.\n"
-        "• Lifestyle — warm interior corner, wood, linen, soft window light.\n"
-        "• Luxury — glossy stone, controlled highlights, dark backdrop.\n\n"
-        "Совет: отправляй исходники как *Документ* — Telegram не сжимает фото."
+        "• Studio — clean background, soft gradient, subtle shadow\n"
+        "• Lifestyle — warm interior, wood/linen, soft window light\n"
+        "• Luxury — glossy stone, controlled highlights, dark backdrop\n\n"
+        "Совет: исходники как Документ — Telegram не сжимает."
     )
-    await message.answer(txt, reply_markup=STYLE_KB, parse_mode="Markdown")
-    await GenStates.waiting_style.set()
+    await message.answer(txt, reply_markup=STYLE_KB)
+    await state.set_state(GenStates.waiting_style)
 
-@dp.message_handler(state=GenStates.waiting_style, content_types=["text"])
-async def got_style(message: types.Message, state: FSMContext):
+@router.message(GenStates.waiting_style, F.text)
+async def generate_result(message: Message, state: FSMContext):
     style_text = (message.text or "").strip()
     await state.update_data(style=style_text)
-    await message.answer("Генерирую…", reply_markup=types.ReplyKeyboardRemove())
+    await message.answer("Генерирую…")
 
     try:
         data = await state.get_data()
-
-        # 0) подтянуть байты исходника по file_id, если нужно (для /repeat)
-        image_bytes = data.get("image")
+        image_bytes: Optional[bytes] = data.get("image")
         if image_bytes is None:
             src_id = data.get("image_file_id")
             if not src_id:
-                raise RuntimeError("Нет исходника: загрузите фото или используйте /start.")
+                await message.answer("Нет исходника — начни со /start")
+                return
             image_bytes = await load_bytes_by_file_id(bot, src_id)
             await state.update_data(image=image_bytes)
 
-        cut_service = data["cut_service"]
+        cut_service = data.get("cut_service", CutService.REMBG.value)
         placement = data.get("placement", Placement.STUDIO.value)
         size_aspect = data.get("size_aspect", "1:1")
         n_variants = int(data.get("n_variants", 1))
 
         openai_size = pick_openai_size(size_aspect)
 
-        # 1) вырезаем один раз
+        # 1) вырезаем фон (один раз)
         if cut_service == CutService.PIXELCUT.value:
             cut_png = remove_bg_pixelcut(image_bytes)
         else:
-            cut_png = remove_bg_rembg(image_bytes)
+            cut_png = remove_bg_rembg_bytes(image_bytes)
 
-        result_file_ids = []
+        result_file_ids: List[str] = []
 
         for i in range(n_variants):
             # 2) генерируем фон
@@ -622,39 +607,32 @@ async def got_style(message: types.Message, state: FSMContext):
 
             # 3) компоновка
             if placement == Placement.STUDIO.value:
-                result = compose_subject_on_bg(
-                    cut_png, bg, scale_by_height=0.74, x_shift=0.0, y_shift=-0.06
-                )
+                result = compose_subject_on_bg(cut_png, bg, scale_by_height=0.74, x_shift=0.0, y_shift=-0.06)
             elif placement == Placement.ON_BODY.value:
                 bw, bh = bg.size
                 x = bw // 2 - 1
-                y = int(bh * 0.38)  # зона шеи
+                y = int(bh * 0.38)
                 result = seamless_place(cut_png, bg, scale_by_height=0.26, x=x, y=y)
-            else:  # IN_HAND
+            else:
                 bw, bh = bg.size
                 x = bw // 2 - 1
-                y = int(bh * 0.5)   # центр
+                y = int(bh * 0.5)
                 result = seamless_place(cut_png, bg, scale_by_height=0.40, x=x, y=y)
 
             # 4) отправка
             buf = io.BytesIO()
             result.save(buf, format="PNG")
-            buf.seek(0)
+            data_bytes = buf.getvalue()
             filename = f"product_{i+1}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png"
-            sent = await message.answer_document(
-                types.InputFile(buf, filename=filename),
-                caption=f"Вариант {i+1}/{n_variants}",
-            )
-            if sent and sent.document:
-                result_file_ids.append(sent.document.file_id)
+            await message.answer_document(BufferedInputFile(data_bytes, filename), caption=f"Вариант {i+1}/{n_variants}")
 
-        # 5) сохранить запись в галерее (метаданные и file_id)
+        # 5) сохранить запись в галерее (метаданные и file_id — если нужно, перехватывай file_id через send result)
         try:
             src_id = data.get("image_file_id", "")
             gallery_save(
                 message.from_user.id,
                 src_file_id=src_id,
-                cut_file_id="",  # вырезку в ТГ не отправляем — пусто
+                cut_file_id="",
                 placement=placement,
                 size_aspect=size_aspect,
                 style_text=style_text,
@@ -662,17 +640,17 @@ async def got_style(message: types.Message, state: FSMContext):
                 result_file_ids=result_file_ids,
             )
         except Exception as e:
-            logging.warning(f"Gallery save failed: {e}")
+            logging.warning("Gallery save failed: %s", e)
 
     except Exception as e:
         logging.exception("Generation error")
         await message.answer(f"Ошибка: {e}")
+    finally:
+        await state.clear()
+        await message.answer("Готово. Пришли ещё фото или /start.")
 
-    await state.finish()
-    await message.answer("Пришли ещё фото или /start.")
-
-@dp.message_handler(commands=["repeat"])
-async def repeat_last(message: types.Message, state: FSMContext):
+@router.message(F.text == "/repeat")
+async def repeat_last(message: Message, state: FSMContext):
     row = gallery_last(message.from_user.id)
     if not row:
         await message.answer("В галерее пока пусто. Сначала сгенерируй фото.")
@@ -684,13 +662,10 @@ async def repeat_last(message: types.Message, state: FSMContext):
         size_aspect=size_aspect,
         n_variants=1,
     )
-    await message.answer(
-        "Повторная генерация с последними настройками. Выбери стиль/пресет или напиши свой промпт.",
-        reply_markup=STYLE_KB,
-    )
-    await GenStates.waiting_style.set()
+    await message.answer("Повторим. Выбери стиль/пресет или напиши свой промпт.", reply_markup=STYLE_KB)
+    await state.set_state(GenStates.waiting_style)
 
-# --- webhook config for Render (aiogram v2) ---
+# ========= webhook server (aiohttp) =========
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
 assert WEBHOOK_BASE_URL, "WEBHOOK_BASE_URL is required"
@@ -699,22 +674,19 @@ WEBHOOK_URL = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.environ.get("PORT", 10000))
 
-async def on_startup(dp):
+async def on_startup_app(app: web.Application):
     await bot.set_webhook(WEBHOOK_URL)
     await _log_bot_info()
     logging.info("Webhook set: %s", WEBHOOK_URL)
 
-async def on_shutdown(dp):
-    logging.info("Shutting down…")
+async def on_shutdown_app(app: web.Application):
     await bot.delete_webhook()
+    logging.info("Webhook deleted")
+
+app = web.Application()
+SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_app)
 
 if __name__ == "__main__":
-    start_webhook(
-        dispatcher=dp,
-        webhook_path=WEBHOOK_PATH,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown,
-        skip_updates=True,
-        host=WEBAPP_HOST,
-        port=WEBAPP_PORT,
-    )
+    logging.info("Server starting on %s:%s", WEBAPP_HOST, WEBAPP_PORT)
+    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
