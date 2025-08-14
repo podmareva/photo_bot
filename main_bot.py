@@ -1,3 +1,9 @@
+try:
+    import rembg  # noqa
+    print("rembg: OK")
+except Exception as e:
+    print("rembg import failed:", repr(e))
+
 from __future__ import annotations
 
 import os
@@ -119,16 +125,23 @@ async def _log_bot_info():
     me = await bot.get_me()
     logging.info("Bot: @%s (%s)", me.username, me.id)
 
-# ========= texts =========
+# ===== TEXTS =====
 WELCOME = (
     "👋 Привет! Ты в боте «Предметный фотограф».\n\n"
-    "Он поможет: сделать предметные фото, заменить фон, создать сцены.\n\n"
-    "Нажми «СТАРТ», чтобы начать."
+    "Он поможет:\n"
+    "• сделать качественные предметные фото,\n"
+    "• заменить фон без потери формы, цвета и надписей,\n"
+    "• создать атмосферные сцены (студийно / на человеке / в руках).\n\n"
+    "🔐 Чтобы начать, нажми «СТАРТ»."
 )
 
 REQUIREMENTS = (
-    "📥 Пришли фото товара.\n\n"
-    "Советы: ровный свет, однотонный фон, лучше отправить как Документ (без сжатия)."
+    "📥 Добавь своё фото.\n\n"
+    "Требования к исходнику для лучшего результата:\n"
+    "• Ровный свет без жёстких теней.\n"
+    "• Нейтральный однотонный фон.\n"
+    "• Предмет целиком, края не обрезаны.\n"
+    "• Максимальное качество (лучше «Документ», чтобы Telegram не сжимал)."
 )
 
 PROMPTS_FILE = Path(__file__).parent / "prompts_cheatsheet.md"
@@ -330,15 +343,13 @@ async def load_bytes_by_file_id(bot: Bot, file_id: str) -> bytes:
     return buf.getvalue()
 
 def remove_bg_rembg_bytes(image_bytes: bytes) -> bytes:
-    if not REMBG_AVAILABLE:
-        raise RuntimeError("rembg не установлен (pip install rembg)")
-    return rembg_remove(
-        image_bytes,
-        alpha_matting=True,
-        alpha_matting_foreground_threshold=240,
-        alpha_matting_background_threshold=10,
-        alpha_matting_erode_size=5,
-    )
+    try:
+        from rembg import remove
+    except Exception as e:
+        # Здесь ошибка будет видна и в логах, и вернётся пользователю
+        raise RuntimeError(f"rembg недоступен: {e}")
+    return remove(image_bytes)
+
 
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     if not PIXELCUT_API_KEY:
