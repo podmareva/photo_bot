@@ -5,5 +5,5 @@ requests
 psycopg2-binary
 opencv-python-headless
 numpy
-rembg
 python-dotenv
+rembg
