@@ -1,3 +1,5 @@
+# main_bot.py — версия только с Премиум (Pixelcut)
+
 import os
 import io
 import base64
@@ -23,7 +25,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
-# webhook + aiohttp server
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
@@ -40,49 +41,6 @@ MAIN_BOT_USERNAME = os.getenv("MAIN_BOT_USERNAME", "")
 
 assert BOT_TOKEN, "BOT_TOKEN is required"
 
-# === OPTIONAL PG (сохраняем только метаданные/file_id) ===
-import psycopg2
-
-def db_exec(q: str, params: tuple = ()):
-    if not DATABASE_URL:
-        return None
-    conn = psycopg2.connect(DATABASE_URL)
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(q, params)
-            if cur.description:
-                return cur.fetchall()
-    finally:
-        conn.close()
-
-def gallery_save(
-    user_id: int,
-    src_file_id: str,
-    cut_file_id: str,
-    placement: str,
-    size_aspect: str,
-    style_text: str,
-    n_variants: int,
-    result_file_ids: List[str],
-):
-    if not DATABASE_URL:
-        return
-    db_exec(
-        """INSERT INTO items(user_id, src_file_id, cut_file_id, placement, size_aspect, style_text, n_variants, result_file_ids)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (user_id, src_file_id, cut_file_id, placement, size_aspect, style_text, n_variants, result_file_ids),
-    )
-
-def gallery_last(user_id: int):
-    if not DATABASE_URL:
-        return None
-    rows = db_exec(
-        """SELECT id, src_file_id, cut_file_id, placement, size_aspect, style_text
-           FROM items WHERE user_id=%s ORDER BY created_at DESC LIMIT 1""",
-        (user_id,),
-    )
-    return rows[0] if rows else None
-
 # ========= logging =========
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
@@ -96,7 +54,7 @@ async def _log_bot_info():
     me = await bot.get_me()
     logging.info("Bot: @%s (%s)", me.username, me.id)
 
-# ===== TEXTS =====
+# ===== TEXTS (оставлено как в твоей версии по смыслу) =====
 WELCOME = (
     "👋 Привет! Ты в боте «Предметный фотограф».\n\n"
     "Он поможет:\n"
@@ -117,142 +75,38 @@ REQUIREMENTS = (
 
 PROMPTS_FILE = Path(__file__).parent / "prompts_cheatsheet.md"
 
-# ====== Содержимое файла prompts_cheatsheet.md (если его нет — создадим) ======
 PROMPTS_MD = """# 📓 Шпаргалка по промптам для генерации сцен
-
-Общее правило: описывай только фон/окружение/свет/настроение. Не упоминай сам товар.
-Промпты — на английском (точнее для модели). Делай короткие фразы через запятую.
-Если важно сохранить вид товара: add — `do not change product color, shape or details`.
-
----
-
-## 1) Чистый каталог / студия
-- white seamless background, soft studio lighting, natural shadows — чистый белый фон, мягкий свет
-- light gradient background, minimalism, soft shadows — светлый градиент, минимализм
-- clean pastel background, centered composition, no props — пастельный фон, без реквизита
-
-## 2) Минимализм
-- matte single-color background, pastel tones, soft shadows — матовый однотон, мягкие тени
-- light concrete wall, soft diffused light — светлый бетон, рассеянный свет
-- beige background, airy atmosphere, no props — бежевый фон, «воздух», без реквизита
-
-## 3) Тёмный премиум / драматичный
-- deep black background, dramatic rim light, high contrast — чёрный фон, контровый свет
-- dark gradient background, soft highlights, premium look — тёмный градиент, мягкие блики
-- black velvet texture, macro shot, controlled reflections — чёрный бархат, контролируемые отражения
-
-## 4) Глянец / камень / мрамор
-- glossy marble surface, dark background, soft studio light — глянцевый мрамор, тёмный фон
-- black granite surface, focused light — чёрный гранит, направленный свет
-- mirror reflection, product on glass, moody lighting — стекло и отражение, атмосферный свет
-
-## 5) Косметика / уход
-- frosted glass surface, gradient background, soft glow — матовое стекло, градиент, свечение
-- acrylic stand, warm diffused light — акриловая подставка, тёплый рассеянный свет
-- mirror tiles, clean pastel background, soft highlights — зеркальная плитка, пастель
-
-## 6) Натуральные материалы
-- light wood table, soft daylight, eucalyptus leaves — светлое дерево, дневной свет, зелень
-- linen fabric folds, warm side light — лён, складки ткани, тёплый боковой
-- stone and wood surface, morning sunlight — камень+дерево, утреннее солнце
-
-## 7) Интерьер
-- cozy living room, wooden furniture, warm sunlight from window — уютная гостиная, тёплый свет из окна
-- modern kitchen, clean surfaces, soft daylight — современная кухня, чистые плоскости
-- spa-style bathroom, stone, greenery, steam glow — спа-ванная, камень, паровое свечение
-
-## 8) Украшение на человеке (автоген)
-- photorealistic human portrait, neutral background, visible neck and collarbone, soft diffused light, shallow depth of field, natural skin tones — портрет, видна шея/ключицы, мягкий свет
-- beauty close-up, neutral background, film grain, warm tones — бьюти-крупный план, нейтральный фон
-- editorial style portrait, soft backlight glow, minimal makeup — фэшн-портрет, мягкая подсветка
-
-## 9) В руках (автоген)
-- photorealistic hands close-up, neutral background, soft window light, macro-friendly composition — крупный план рук, мяглый свет из окна
-- female hands, natural skin texture, shallow depth of field — женские руки, естественная кожа, малая ГРИП
-- hands holding space, warm interior bokeh, cozy mood — руки с «пустым местом», тёплое боке
-
-## 10) Сезоны
-**Лето**
-- sunlight, leaf shadows, warm tones — солнечный свет, тени листвы
-- beach sand, soft waves, bright sky — пляж, волны, яркое небо
-
-**Осень**
-- golden hour light, autumn leaves, cozy atmosphere — золотой час, листья, уют
-- wooden table, pumpkins, warm side light — стол, тыквы, тёплый боковой
-
-**Зима**
-- snow-covered branches, cold blue light — снег, холодный голубой свет
-- cozy interior, fairy lights, Christmas mood — уют, гирлянды, новый год
-
-**Весна**
-- fresh greenery, blooming branches, soft sunlight — свежая зелень, цветы, мягкое солнце
-- pastel background, gentle glow — пастель, мягкое свечение
-
-## 11) Праздники / огни
-- warm bokeh lights, dark background, cozy mood — тёплое боке на тёмном
-- bright garlands, festive atmosphere — яркие гирлянды, праздник
-- fireworks background, high contrast — фейерверки, контраст
-
-## 12) Flat Lay (вид сверху)
-- top view, matte surface, soft light, minimal props — вид сверху, матовая поверхность
-- pastel background, neat composition — пастель, аккуратная раскладка
-- wooden table, props around edges, soft shadows — дерево, реквизит по краям
-
-## 13) Техно / индустриальный
-- smooth concrete, cold directional light, graphic shadows — гладкий бетон, холодный свет
-- metallic surface, reflections, blue highlights — металл, отражения, синие акценты
-- neon accents, black background — неон, чёрный фон
-
-## 14) Усилители качества (добавляй в конец)
-- photorealistic, ultra detailed, 8k
-- studio softbox lighting, realistic textures
-- centered composition, generous negative space
-- natural soft shadows
-- no props, no text
+(сокращено) — опиши фон/свет/настроение, без товара; английский, короткими фразами.
+Примеры: studio soft light; dark premium look; glossy marble; cozy interior, warm sunlight; etc.
 """
 
 # ========= states =========
 class GenStates(StatesGroup):
     waiting_start = State()
     waiting_photo = State()
-    waiting_service = State()
-    waiting_placement = State()
     waiting_size = State()
     waiting_variants = State()
     waiting_style = State()
+    waiting_placement = State()
 
 # ========= choices/keyboards =========
-class CutService(str, Enum):
-    REMBG = "Эконом (RemBG — бесплатно)"
-    PIXELCUT = "Премиум (Pixelcut — лучше качество)"
-
 class Placement(str, Enum):
     STUDIO = "Студийно (на фоне)"
     ON_BODY = "На человеке (украшение/одежда)"
     IN_HAND = "В руках (крупный план)"
 
-# Кнопка СТАРТ + шпаргалка
 start_kb = ReplyKeyboardBuilder()
 start_kb.button(text="СТАРТ")
 start_kb.button(text="📓 Шпаргалка по промтам")
 start_kb.adjust(2)
 START_KB = start_kb.as_markup(resize_keyboard=True)
 
-# выбор сервиса вырезки
-cut_kb = ReplyKeyboardBuilder()
-cut_kb.button(text=CutService.REMBG.value)
-cut_kb.button(text=CutService.PIXELCUT.value)
-cut_kb.adjust(1)
-CUT_KB = cut_kb.as_markup(resize_keyboard=True)
-
-# расположение
 place_kb = ReplyKeyboardBuilder()
 for p in (Placement.STUDIO.value, Placement.ON_BODY.value, Placement.IN_HAND.value):
     place_kb.button(text=p)
 place_kb.adjust(1)
 PLACEMENT_KB = place_kb.as_markup(resize_keyboard=True)
 
-# пресеты стиля
 PRESETS = [
     "Каталог: чистый студийный фон, мягкая тень",
     "Минимализм: однотон, мягкие тени",
@@ -268,7 +122,6 @@ style_kb_builder.button(text="Своя сцена (опишу текстом)")
 style_kb_builder.adjust(1)
 STYLE_KB = style_kb_builder.as_markup(resize_keyboard=True)
 
-# размеры и количество
 size_kb = ReplyKeyboardBuilder()
 for s in ("1:1", "4:5", "3:4", "16:9", "9:16"):
     size_kb.button(text=s)
@@ -294,7 +147,6 @@ async def check_user_access(user_id: int) -> bool:
     return True  # пускаем всех
 
 async def download_bytes_from_message(bot: Bot, message: Message) -> tuple[bytes, str]:
-    """Скачать байты файла из сообщения + вернуть file_id для галереи."""
     if message.document:
         file_id = message.document.file_id
         buf = io.BytesIO()
@@ -313,31 +165,17 @@ async def load_bytes_by_file_id(bot: Bot, file_id: str) -> bytes:
     await bot.download(file_id, destination=buf)
     return buf.getvalue()
 
-# ====== REMBG (free) ======
-def remove_bg_rembg_bytes(image_bytes: bytes) -> bytes:
+# ====== Pixelcut ONLY ======
+
+def _validate_image_bytes(image_bytes: bytes) -> None:
+    """Проверка, что отправляем реальную картинку, иначе Pixelcut вернёт 400."""
+    if not isinstance(image_bytes, (bytes, bytearray)) or len(image_bytes) < 1024:
+        raise RuntimeError("Исходный файл пустой или слишком маленький (<1 КБ)")
     try:
-        from rembg import remove, new_session
+        Image.open(BytesIO(image_bytes)).verify()
     except Exception as e:
-        raise RuntimeError(f"rembg недоступен: {e}")
-    try:
-        session = new_session("u2netp")  # меньше RAM и быстрее
-        return remove(image_bytes, session=session)
-    except Exception as e:
-        raise RuntimeError(f"Ошибка rembg: {e}")
+        raise RuntimeError(f"Файл не распознан как изображение: {e}")
 
-import asyncio
-
-async def remove_bg_rembg_bytes_async(image_bytes: bytes) -> bytes:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, remove_bg_rembg_bytes, image_bytes)
-
-async def generate_with_rembg_or_timeout(image_bytes: bytes) -> bytes:
-    try:
-        return await asyncio.wait_for(remove_bg_rembg_bytes_async(image_bytes), timeout=40)
-    except asyncio.TimeoutError:
-        raise RuntimeError("rembg: истек таймаут 40с. Попробуйте Премиум или другое фото.")
-
-# ====== Pixelcut (premium) ======
 def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
     """Гарантируем корректный RGB-JPEG без альфы для внешнего API."""
     img = Image.open(BytesIO(image_bytes))
@@ -351,26 +189,40 @@ def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
     img.save(buf, format="JPEG", quality=95)
     return buf.getvalue()
 
-def build_pixelcut_headers() -> dict:
-    """Официальный метод Pixelcut: ключ в X-API-Key."""
-    if not PIXELCUT_API_KEY:
+def _pixelcut_headers() -> dict:
+    key = PIXELCUT_API_KEY
+    if not key:
         raise RuntimeError("PIXELCUT_API_KEY не задан")
-    return {"X-API-Key": PIXELCUT_API_KEY}
+    # remove-background ожидает X-API-Key
+    return {"X-API-Key": key}
 
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
-    if not PIXELCUT_ENDPOINT:
+    endpoint = PIXELCUT_ENDPOINT.strip()
+    if not endpoint:
         raise RuntimeError("PIXELCUT_ENDPOINT не задан")
-    headers = build_pixelcut_headers()
+
+    _validate_image_bytes(image_bytes)
+
     jpg = ensure_jpg_bytes(image_bytes)
-    files = {"image": ("input.jpg", BytesIO(jpg), "image/jpeg")}  # одно поле 'image'
-    r = requests.post(PIXELCUT_ENDPOINT, headers=headers, files=files, timeout=120)
+    if len(jpg) < 1024:
+        raise RuntimeError("После конвертации в JPEG файл слишком маленький")
+
+    files = {"image": ("input.jpg", BytesIO(jpg), "image/jpeg")}  # только одно поле 'image'
+    headers = _pixelcut_headers()
+
+    r = requests.post(endpoint, headers=headers, files=files, timeout=120)
     if r.status_code == 200:
         return r.content
+
+    # Развёрнутый ответ для диагностики
     try:
         detail = r.json()
     except Exception:
         detail = r.text
+    logging.error("Pixelcut %s: %s", r.status_code, detail)
     raise RuntimeError(f"Ошибка Pixelcut: {r.status_code}: {detail}")
+
+# ====== фон/генерация сцены ======
 
 def pick_openai_size(aspect: str) -> str:
     if aspect == "1:1":
@@ -398,6 +250,8 @@ def center_crop_to_aspect(img: Image.Image, aspect: str) -> Image.Image:
         new_h = int(w / r)
         y1 = (h - new_h) // 2
         return img.crop((0, y1, w, y1 + new_h))
+
+OPENAI_IMAGES_ENDPOINT = "https://api.openai.com/v1/images/generations"
 
 def generate_background(prompt: str, size: str = "1024x1024") -> Image.Image:
     assert OPENAI_API_KEY, "OPENAI_API_KEY is required"
@@ -503,16 +357,6 @@ async def pressed_start(message: Message, state: FSMContext):
 async def got_photo(message: Message, state: FSMContext):
     image_bytes, file_id = await download_bytes_from_message(bot, message)
     await state.update_data(image=image_bytes, image_file_id=file_id)
-    await message.answer("Чем вырезать фон?", reply_markup=CUT_KB)
-    await state.set_state(GenStates.waiting_service)
-
-@router.message(GenStates.waiting_service, F.text)
-async def choose_service(message: Message, state: FSMContext):
-    choice = (message.text or "").strip()
-    if choice not in (CutService.REMBG.value, CutService.PIXELCUT.value):
-        await message.answer("Выбери вариант на клавиатуре.")
-        return
-    await state.update_data(cut_service=choice)
     await message.answer("Выбери расположение товара:", reply_markup=PLACEMENT_KB)
     await state.set_state(GenStates.waiting_placement)
 
@@ -571,18 +415,14 @@ async def generate_result(message: Message, state: FSMContext):
             image_bytes = await load_bytes_by_file_id(bot, src_id)
             await state.update_data(image=image_bytes)
 
-        cut_service = data.get("cut_service", CutService.REMBG.value)
         placement = data.get("placement", Placement.STUDIO.value)
         size_aspect = data.get("size_aspect", "1:1")
         n_variants = int(data.get("n_variants", 1))
 
         openai_size = pick_openai_size(size_aspect)
 
-        # 1) вырезаем фон (один раз)
-        if cut_service == CutService.PIXELCUT.value:
-            cut_png = remove_bg_pixelcut(image_bytes)
-        else:
-            cut_png = await generate_with_rembg_or_timeout(image_bytes)
+        # 1) вырезаем фон через Pixelcut (премиум)
+        cut_png = remove_bg_pixelcut(image_bytes)
 
         result_file_ids: List[str] = []
 
@@ -629,44 +469,14 @@ async def generate_result(message: Message, state: FSMContext):
             filename = f"product_{i+1}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png"
             await message.answer_document(BufferedInputFile(data_bytes, filename), caption=f"Вариант {i+1}/{n_variants}")
 
-        # 5) сохранить запись в галерее
-        try:
-            src_id = data.get("image_file_id", "")
-            gallery_save(
-                message.from_user.id,
-                src_file_id=src_id,
-                cut_file_id="",
-                placement=placement,
-                size_aspect=size_aspect,
-                style_text=style_text,
-                n_variants=n_variants,
-                result_file_ids=result_file_ids,
-            )
-        except Exception as e:
-            logging.warning("Gallery save failed: %s", e)
+        # 5) очистка стейта
+        await state.clear()
+        await message.answer("Готово. Пришли ещё фото или /start.")
 
     except Exception as e:
         logging.exception("Generation error")
         await message.answer(f"Ошибка: {e}")
-    finally:
-        await state.clear()
-        await message.answer("Готово. Пришли ещё фото или /start.")
-
-@router.message(F.text == "/repeat")
-async def repeat_last(message: Message, state: FSMContext):
-    row = gallery_last(message.from_user.id)
-    if not row:
-        await message.answer("В галерее пока пусто. Сначала сгенерируй фото.")
-        return
-    _id, src_file_id, cut_file_id, placement, size_aspect, style_text = row
-    await state.update_data(
-        image_file_id=src_file_id,
-        placement=placement,
-        size_aspect=size_aspect,
-        n_variants=1,
-    )
-    await message.answer("Повторим. Выбери стиль/пресет или напиши свой промпт.", reply_markup=STYLE_KB)
-    await state.set_state(GenStates.waiting_style)
+        # стейт не чистим, чтобы можно было повторить/исправить
 
 # === Webhook server (единый) ===
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
@@ -676,6 +486,7 @@ WEBHOOK_URL = BASE_URL + WEBHOOK_PATH
 
 async def on_startup_app(app: web.Application):
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    await _log_bot_info()
 
 async def on_shutdown_app(app: web.Application):
     await bot.delete_webhook()
