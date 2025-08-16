@@ -1,4 +1,4 @@
-# main_bot.py — версия только с Премиум (Pixelcut)
+# main_bot.py — Исправленная и очищенная версия
 
 import os
 import io
@@ -54,7 +54,7 @@ async def _log_bot_info():
     me = await bot.get_me()
     logging.info("Bot: @%s (%s)", me.username, me.id)
 
-# ===== TEXTS (оставлено как в твоей версии по смыслу) =====
+# ===== TEXTS =====
 WELCOME = (
     "👋 Привет! Ты в боте «Предметный фотограф».\n\n"
     "Он поможет:\n"
@@ -74,7 +74,6 @@ REQUIREMENTS = (
 )
 
 PROMPTS_FILE = Path(__file__).parent / "prompts_cheatsheet.md"
-
 PROMPTS_MD = """# 📓 Шпаргалка по промптам для генерации сцен
 (сокращено) — опиши фон/свет/настроение, без товара; английский, короткими фразами.
 Примеры: studio soft light; dark premium look; glossy marble; cozy interior, warm sunlight; etc.
@@ -135,8 +134,6 @@ var_kb.adjust(5)
 VAR_KB = var_kb.as_markup(resize_keyboard=True)
 
 # ========= helpers =========
-OPENAI_IMAGES_ENDPOINT = "https://api.openai.com/v1/images/generations"
-
 def ensure_prompts_file():
     if not PROMPTS_FILE.exists():
         PROMPTS_FILE.write_text(PROMPTS_MD, encoding="utf-8")
@@ -165,7 +162,7 @@ async def load_bytes_by_file_id(bot: Bot, file_id: str) -> bytes:
     await bot.download(file_id, destination=buf)
     return buf.getvalue()
 
-# ====== Pixelcut ONLY ======
+# ====== Pixelcut API Calls ======
 
 def _validate_image_bytes(image_bytes: bytes) -> None:
     """Проверка, что отправляем реальную картинку, иначе Pixelcut вернёт 400."""
@@ -186,41 +183,14 @@ def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
     elif img.mode != "RGB":
         img = img.convert("RGB")
     buf = BytesIO()
-    img.save(buf, format="JPEG", quality=95)
+    img.save(buf, format="JPEG", quality=95, optimize=True)
     return buf.getvalue()
 
-def _pixelcut_headers() -> dict:
-    key = PIXELCUT_API_KEY
-    if not key:
-        raise RuntimeError("PIXELCUT_API_KEY не задан")
-    # remove-background ожидает X-API-Key
-    return {"X-API-Key": key}
-
-from io import BytesIO
-import os, logging, requests
-from PIL import Image
-
-def _validate_image_bytes(image_bytes: bytes) -> None:
-    if not isinstance(image_bytes, (bytes, bytearray)) or len(image_bytes) < 2048:
-        raise RuntimeError("Исходный файл пустой или слишком маленький (<2 КБ)")
-    try:
-        Image.open(BytesIO(image_bytes)).verify()
-    except Exception as e:
-        raise RuntimeError(f"Файл не распознан как изображение: {e}")
-
-def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
-    img = Image.open(BytesIO(image_bytes))
-    if img.mode in ("RGBA", "LA"):
-        bg = Image.new("RGB", img.size, (255, 255, 255))
-        bg.paste(img, mask=img.split()[-1])
-        img = bg
-    elif img.mode != "RGB":
-        img = img.convert("RGB")
-    out = BytesIO()
-    img.save(out, format="JPEG", quality=95, optimize=True)
-    return out.getvalue()
-
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
+    """
+    Отправляет запрос в Pixelcut, перебирая возможные заголовки авторизации
+    и имена поля с файлом, чтобы найти рабочую комбинацию.
+    """
     endpoint = os.getenv("PIXELCUT_ENDPOINT", "").strip()
     key = os.getenv("PIXELCUT_API_KEY", "").strip()
     if not endpoint:
@@ -233,104 +203,96 @@ def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     if len(jpg) < 2048:
         raise RuntimeError("После конвертации в JPEG файл слишком маленький")
 
-    # 1) кандидаты заголовка авторизации
     headers_list = [
-        {"X-API-Key": key},                          # спецификация remove-background
-        {"Authorization": f"Bearer {key}"},          # встречается на некоторых тарифах
+        {"X-API-Key": key},
+        {"Authorization": f"Bearer {key}"},
     ]
-
-    # 2) кандидаты имени поля с файлом
     field_names = ["image", "image_file", "file", "file_upload"]
+    last_detail = "Не удалось связаться с API"
 
-    last_detail = None
     for hdr in headers_list:
         for field in field_names:
             files = {field: ("input.jpg", BytesIO(jpg), "image/jpeg")}
             try:
-                logging.info("Pixelcut: пробую header=%s, field=%s, size=%d",
-                             list(hdr.keys())[0], field, len(jpg))
+                logging.info("Pixelcut: пробую header=%s, field=%s", list(hdr.keys())[0], field)
                 r = requests.post(endpoint, headers=hdr, files=files, timeout=120)
 
-                # успех
                 if r.status_code == 200:
-                    logging.info("Pixelcut: успех с header=%s, field=%s",
-                                 list(hdr.keys())[0], field)
+                    logging.info("Pixelcut: Успех с header=%s, field=%s", list(hdr.keys())[0], field)
                     return r.content
 
-                # не успех — читаем деталь
                 try:
                     detail = r.json()
                 except Exception:
                     detail = r.text
+                
+                last_detail = f"{r.status_code}: {detail}"
+                logging.warning("Pixelcut: %s при header=%s, field=%s: %s", r.status_code, list(hdr.keys())[0], field, detail)
 
-                logging.warning("Pixelcut: %s при header=%s, field=%s: %s",
-                                r.status_code, list(hdr.keys())[0], field, detail)
-
-                # если жалуется на формат/отсутствие файла/неверный параметр — пробуем дальше
+                # Если ошибка связана с отсутствием файла или неверным параметром, пробуем следующую комбинацию
                 if r.status_code == 400 and any(
                     s in str(detail).lower()
                     for s in ["unsupported", "missing", "invalid_parameter", "image file is missing"]
                 ):
-                    last_detail = f"{r.status_code}: {detail}"
                     continue
-
-                # иные ошибки (401/403/5xx) — сразу отдаём наружу
-                raise RuntimeError(f"Ошибка Pixelcut: {r.status_code}: {detail}")
+                
+                # Иные ошибки (401/403/5xx) — сразу сообщаем пользователю
+                raise RuntimeError(f"Ошибка Pixelcut: {last_detail}")
 
             except requests.RequestException as e:
-                last_detail = f"network: {e}"
-                logging.error("Pixelcut network error with header=%s field=%s: %s",
-                              list(hdr.keys())[0], field, e)
+                last_detail = f"Ошибка сети: {e}"
+                logging.error("Pixelcut network error with header=%s field=%s: %s", list(hdr.keys())[0], field, e)
 
-    raise RuntimeError(f"Ошибка Pixelcut: не удалось подобрать заголовок/поле. Последний ответ: {last_detail}")
+    raise RuntimeError(f"Ошибка Pixelcut: не удалось подобрать параметры запроса. Последний ответ: {last_detail}")
 
 
-# ====== фон/генерация сцены ======
+# ====== Image Generation ======
+
+OPENAI_IMAGES_ENDPOINT = "https://api.openai.com/v1/images/generations"
 
 def pick_openai_size(aspect: str) -> str:
-    if aspect == "1:1":
-        return "1024x1024"
-    if aspect in ("4:5", "3:4", "9:16"):
-        return "1024x1792"
-    if aspect == "16:9":
-        return "1792x1024"
+    if aspect == "1:1": return "1024x1024"
+    if aspect in ("4:5", "3:4", "9:16"): return "1024x1792"
+    if aspect == "16:9": return "1792x1024"
     return "1024x1024"
 
 def center_crop_to_aspect(img: Image.Image, aspect: str) -> Image.Image:
     w, h = img.size
-    targets = {"1:1": 1/1, "4:5": 4/5, "3:4": 3/4, "16:9": 16/9, "9:16": 9/16}
-    if aspect not in targets:
-        return img
-    r = targets[aspect]
-    cur = w / h
-    if abs(cur - r) < 1e-3:
-        return img
-    if cur > r:
-        new_w = int(h * r)
+    targets = {"1:1": 1.0, "4:5": 4/5, "3:4": 3/4, "16:9": 16/9, "9:16": 9/16}
+    if aspect not in targets: return img
+    
+    target_ratio = targets[aspect]
+    current_ratio = w / h
+    
+    if abs(current_ratio - target_ratio) < 1e-3: return img
+
+    if current_ratio > target_ratio:
+        new_w = int(h * target_ratio)
         x1 = (w - new_w) // 2
         return img.crop((x1, 0, x1 + new_w, h))
     else:
-        new_h = int(w / r)
+        new_h = int(w / target_ratio)
         y1 = (h - new_h) // 2
         return img.crop((0, y1, w, y1 + new_h))
-
-OPENAI_IMAGES_ENDPOINT = "https://api.openai.com/v1/images/generations"
 
 def generate_background(prompt: str, size: str = "1024x1024") -> Image.Image:
     assert OPENAI_API_KEY, "OPENAI_API_KEY is required"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": "gpt-image-1",
+        "model": "dall-e-3", # Рекомендуется использовать актуальную модель
         "prompt": (
             "High-quality product photography background only (no product). "
             "Cinematic lighting, realistic textures. " + prompt
         ),
         "size": size,
         "n": 1,
+        "quality": "hd",
+        "response_format": "b64_json"
     }
     r = requests.post(OPENAI_IMAGES_ENDPOINT, headers=headers, json=payload, timeout=120)
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI image gen error {r.status_code}: {r.text}")
+    
     b64 = r.json()["data"][0]["b64_json"]
     bg_bytes = base64.b64decode(b64)
     return Image.open(io.BytesIO(bg_bytes)).convert("RGBA")
@@ -347,14 +309,18 @@ def compose_subject_on_bg(
     canvas_w, canvas_h = bg_img.size
     target_h = int(canvas_h * scale_by_height)
     scale = target_h / max(1, subj.height)
-    subj = subj.resize((max(1, int(subj.width * scale)), max(1, int(subj.height * scale))), Image.LANCZOS)
+    subj = subj.resize((max(1, int(subj.width * scale)), target_h), Image.LANCZOS)
+    
+    # Создание тени
     alpha = subj.split()[-1]
     shadow = Image.new("RGBA", subj.size, (0, 0, 0, 160))
     shadow.putalpha(alpha)
     shadow = shadow.filter(ImageFilter.GaussianBlur(12))
+    
     out = bg_img.copy()
-    x = int((canvas_w - subj.width) * 0.5 + x_shift * canvas_w)
+    x = int((canvas_w - subj.width) / 2 + x_shift * canvas_w)
     y = int(canvas_h - subj.height + y_shift * canvas_h)
+    
     out.alpha_composite(shadow, (x + 8, y + 18))
     out.alpha_composite(subj, (x, y))
     return out
@@ -369,25 +335,36 @@ def seamless_place(
 ) -> Image.Image:
     fore = Image.open(io.BytesIO(subject_png)).convert("RGBA")
     back = back_img.convert("RGB")
+    
     bw, bh = back.size
     target_h = int(bh * scale_by_height)
     ratio = target_h / max(1, fore.height)
     fore = fore.resize((max(1, int(fore.width * ratio)), target_h), Image.LANCZOS)
-    fore_rgb = cv2.cvtColor(np.array(fore.convert("RGB")), cv2.COLOR_RGB2BGR)
-    back_bgr = cv2.cvtColor(np.array(back), cv2.COLOR_RGB2BGR)
+    
+    fore_rgb_np = cv2.cvtColor(np.array(fore.convert("RGB")), cv2.COLOR_RGB2BGR)
+    back_bgr_np = cv2.cvtColor(np.array(back), cv2.COLOR_RGB2BGR)
     mask = np.array(fore.split()[-1])
-    fh, fw = fore_rgb.shape[:2]
-    x = max(0, min(back_bgr.shape[1] - fw, x))
-    y = max(0, min(back_bgr.shape[0] - fh, y))
-    canvas = np.zeros_like(back_bgr)
-    canvas[y:y+fh, x:x+fw] = fore_rgb
-    mask_full = np.zeros(back_bgr.shape[:2], dtype=np.uint8)
+    
+    fh, fw = fore_rgb_np.shape[:2]
+    # Корректное определение центра для вставки
+    center_x = x + fw // 2
+    center_y = y + fh // 2
+
+    # Убедимся, что объект не выходит за границы фона
+    x = max(0, min(bw - fw, x))
+    y = max(0, min(bh - fh, y))
+
+    # Создаем холст для объекта и полную маску
+    obj_canvas = np.zeros_like(back_bgr_np)
+    obj_canvas[y:y+fh, x:x+fw] = fore_rgb_np
+    
+    mask_full = np.zeros(back_bgr_np.shape[:2], dtype=np.uint8)
     mask_full[y:y+fh, x:x+fw] = mask
-    center = (x + fw // 2, y + fh // 2)
-    mixed = cv2.seamlessClone(canvas, back_bgr, mask_full, center, cv2.NORMAL_CLONE)
+    
+    mixed = cv2.seamlessClone(fore_rgb_np, back_bgr_np, mask, (center_x, center_y), cv2.NORMAL_CLONE)
     return Image.fromarray(cv2.cvtColor(mixed, cv2.COLOR_BGR2RGB))
 
-# ========= handlers =========
+# ========= Handlers =========
 @router.message(CommandStart())
 async def on_start(message: Message, state: FSMContext):
     if not await check_user_access(message.from_user.id):
@@ -418,16 +395,20 @@ async def pressed_start(message: Message, state: FSMContext):
 
 @router.message(GenStates.waiting_photo, F.document | F.photo)
 async def got_photo(message: Message, state: FSMContext):
-    image_bytes, file_id = await download_bytes_from_message(bot, message)
-    await state.update_data(image=image_bytes, image_file_id=file_id)
-    await message.answer("Выбери расположение товара:", reply_markup=PLACEMENT_KB)
-    await state.set_state(GenStates.waiting_placement)
+    try:
+        image_bytes, file_id = await download_bytes_from_message(bot, message)
+        await state.update_data(image=image_bytes, image_file_id=file_id)
+        await message.answer("Выбери расположение товара:", reply_markup=PLACEMENT_KB)
+        await state.set_state(GenStates.waiting_placement)
+    except Exception as e:
+        logging.error(f"Error processing photo: {e}")
+        await message.answer("Не удалось обработать фото. Попробуй другое.")
 
 @router.message(GenStates.waiting_placement, F.text)
 async def choose_placement(message: Message, state: FSMContext):
     val = (message.text or "").strip()
     if val not in (Placement.STUDIO.value, Placement.ON_BODY.value, Placement.IN_HAND.value):
-        await message.answer("Выбери один из вариантов.")
+        await message.answer("Выбери один из вариантов с помощью клавиатуры.")
         return
     await state.update_data(placement=val)
     await message.answer("Выбери размер (соотношение сторон):", reply_markup=SIZE_KB)
@@ -447,112 +428,32 @@ async def choose_size(message: Message, state: FSMContext):
 async def choose_variants(message: Message, state: FSMContext):
     try:
         n = int((message.text or "1").strip())
+        n = max(1, min(5, n))
     except ValueError:
         n = 1
-    n = max(1, min(5, n))
     await state.update_data(n_variants=n)
     txt = (
         "Выбери сцену или опиши свою.\n\n"
         "• Studio — clean background, soft gradient, subtle shadow\n"
         "• Lifestyle — warm interior, wood/linen, soft window light\n"
-        "• Luxury — glossy stone, controlled highlights, dark backdrop\n\n"
-        "Совет: исходники как Документ — Telegram не сжимает."
+        "• Luxury — glossy stone, controlled highlights, dark backdrop"
     )
     await message.answer(txt, reply_markup=STYLE_KB)
     await state.set_state(GenStates.waiting_style)
-from io import BytesIO
-from PIL import Image
-import os, requests, logging
-
-def _validate_image_bytes(image_bytes: bytes) -> None:
-    if not isinstance(image_bytes, (bytes, bytearray)) or len(image_bytes) < 1024:
-        raise RuntimeError("Исходный файл пустой или слишком маленький (<1 КБ)")
-    try:
-        Image.open(BytesIO(image_bytes)).verify()
-    except Exception as e:
-        raise RuntimeError(f"Файл не распознан как изображение: {e}")
-
-def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
-    """
-    Гарантированный RGB-JPEG без альфы (Pixelcut принимает JPEG/PNG).
-    Никаких EXIF/ICC — максимально простой JPEG.
-    """
-    img = Image.open(BytesIO(image_bytes))
-    if img.mode in ("RGBA", "LA"):
-        bg = Image.new("RGB", img.size, (255, 255, 255))
-        bg.paste(img, mask=img.split()[-1])
-        img = bg
-    elif img.mode != "RGB":
-        img = img.convert("RGB")
-    out = BytesIO()
-    img.save(out, format="JPEG", quality=95, optimize=True)
-    return out.getvalue()
-
-def _pixelcut_headers() -> dict:
-    key = os.getenv("PIXELCUT_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("PIXELCUT_API_KEY не задан")
-    # Для /v1/remove-background корректный заголовок — X-API-Key
-    return {"X-API-Key": key}
-
-def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
-    """
-    Премиум: шлём multipart с файлом. Перебираем возможные имена поля:
-    'image' → 'image_file' → 'file' → 'file_upload'.
-    Это закрывает 400 'Unsupported format'/'invalid_parameter' на отдельных аккаунтах/путях.
-    """
-    endpoint = os.getenv("PIXELCUT_ENDPOINT", "").strip()
-    if not endpoint:
-        raise RuntimeError("PIXELCUT_ENDPOINT не задан")
-
-    _validate_image_bytes(image_bytes)
-    jpg = ensure_jpg_bytes(image_bytes)
-    if len(jpg) < 1024:
-        raise RuntimeError("После конвертации в JPEG файл слишком маленький")
-
-    headers = _pixelcut_headers()
-
-    def _call(field: str) -> bytes:
-        # ВАЖНО: одно поле с типом image/jpeg; Content-Type формирует requests
-        files = {field: ("input.jpg", BytesIO(jpg), "image/jpeg")}
-        r = requests.post(endpoint, headers=headers, files=files, timeout=120)
-        if r.status_code == 200:
-            return r.content
-        try:
-            detail = r.json()
-        except Exception:
-            detail = r.text
-        raise RuntimeError(f"{r.status_code}: {detail}")
-
-    last_err = None
-    for field in ("image", "image_file", "file", "file_upload"):
-        try:
-            return _call(field)
-        except RuntimeError as e:
-            msg = str(e).lower()
-            # Если жалуется на формат/параметр — пробуем следующее имя
-            if "unsupported" in msg or "invalid_parameter" in msg or "missing" in msg:
-                last_err = e
-                continue
-            # Иные ошибки (401/403/5xx) — пробрасываем сразу
-            raise RuntimeError(f"Ошибка Pixelcut: {e}")
-
-    # Если все варианты не зашли — отдадим последнюю понятную причину
-    raise RuntimeError(f"Ошибка Pixelcut: {last_err}")
 
 @router.message(GenStates.waiting_style, F.text)
 async def generate_result(message: Message, state: FSMContext):
     style_text = (message.text or "").strip()
     await state.update_data(style=style_text)
-    await message.answer("Генерирую…")
+    await message.answer("Принято! Начинаю магию ✨\nЭто может занять 1-2 минуты...", reply_markup=None)
 
     try:
         data = await state.get_data()
         image_bytes: Optional[bytes] = data.get("image")
-        if image_bytes is None:
+        if not image_bytes:
             src_id = data.get("image_file_id")
             if not src_id:
-                await message.answer("Нет исходника — начни со /start")
+                await message.answer("Не нашел исходное фото. Пожалуйста, начни заново с /start")
                 return
             image_bytes = await load_bytes_by_file_id(bot, src_id)
             await state.update_data(image=image_bytes)
@@ -560,67 +461,54 @@ async def generate_result(message: Message, state: FSMContext):
         placement = data.get("placement", Placement.STUDIO.value)
         size_aspect = data.get("size_aspect", "1:1")
         n_variants = int(data.get("n_variants", 1))
-
         openai_size = pick_openai_size(size_aspect)
 
-        # 1) вырезаем фон через Pixelcut (премиум)
+        # 1) Вырезаем фон
+        msg = await message.answer("Шаг 1/3: Удаляю фон с твоего фото...")
         cut_png = remove_bg_pixelcut(image_bytes)
 
-        result_file_ids: List[str] = []
-
         for i in range(n_variants):
-            # 2) генерируем фон
+            await msg.edit_text(f"Шаг 2/3: Генерирую сцену ({i+1}/{n_variants})...")
+            # 2) Генерируем фон
             if placement == Placement.STUDIO.value:
-                prompt = (
-                    f"{style_text}. Background only, no product. "
-                    "photorealistic, studio lighting, realistic textures, no text."
-                )
+                prompt = f"{style_text}. Background only, no product. photorealistic, studio lighting, realistic textures, no text."
             elif placement == Placement.ON_BODY.value:
-                prompt = (
-                    f"{style_text}. photorealistic human portrait, neutral background, "
-                    "visible neck and collarbone, soft diffused light, shallow depth of field, "
-                    "natural skin tones, allow central empty area for necklace, no text."
-                )
+                prompt = f"{style_text}. photorealistic human portrait, neutral background, visible neck and collarbone, soft diffused light, shallow depth of field, natural skin tones, allow central empty area for necklace, no text."
             else:  # IN_HAND
-                prompt = (
-                    f"{style_text}. photorealistic hands close-up, neutral background, soft window light, "
-                    "macro-friendly composition, allow central empty area for product, no text."
-                )
+                prompt = f"{style_text}. photorealistic hands close-up, neutral background, soft window light, macro-friendly composition, allow central empty area for product, no text."
 
             bg = generate_background(prompt, size=openai_size)
             bg = center_crop_to_aspect(bg, size_aspect)
 
-            # 3) компоновка
+            await msg.edit_text(f"Шаг 3/3: Совмещаю товар и фон ({i+1}/{n_variants})...")
+            # 3) Компонуем
             if placement == Placement.STUDIO.value:
                 result = compose_subject_on_bg(cut_png, bg, scale_by_height=0.74, x_shift=0.0, y_shift=-0.06)
             elif placement == Placement.ON_BODY.value:
                 bw, bh = bg.size
-                x = bw // 2 - 1
-                y = int(bh * 0.38)
-                result = seamless_place(cut_png, bg, scale_by_height=0.26, x=x, y=y)
-            else:
+                result = seamless_place(cut_png, bg, scale_by_height=0.26, x=int(bw*0.5), y=int(bh*0.38))
+            else: # IN_HAND
                 bw, bh = bg.size
-                x = bw // 2 - 1
-                y = int(bh * 0.5)
-                result = seamless_place(cut_png, bg, scale_by_height=0.40, x=x, y=y)
+                result = seamless_place(cut_png, bg, scale_by_height=0.40, x=int(bw*0.5), y=int(bh*0.5))
 
-            # 4) отправка
+            # 4) Отправляем результат
             buf = io.BytesIO()
             result.save(buf, format="PNG")
             data_bytes = buf.getvalue()
-            filename = f"product_{i+1}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png"
+            filename = f"result_{i+1}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png"
             await message.answer_document(BufferedInputFile(data_bytes, filename), caption=f"Вариант {i+1}/{n_variants}")
 
-        # 5) очистка стейта
+        await msg.delete()
         await state.clear()
-        await message.answer("Готово. Пришли ещё фото или /start.")
+        await message.answer("✅ Готово! Можешь прислать следующее фото или нажми /start для смены настроек.", reply_markup=START_KB)
+        await state.set_state(GenStates.waiting_start)
 
     except Exception as e:
         logging.exception("Generation error")
-        await message.answer(f"Ошибка: {e}")
-        # стейт не чистим, чтобы можно было повторить/исправить
+        await message.answer(f"Что-то пошло не так 😥\nОшибка: {e}\n\nПопробуй ещё раз или начни с /start.")
+        # Стейт не чистим, чтобы можно было повторить/исправить
 
-# === Webhook server (единый) ===
+# === Webhook server ===
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 assert BASE_URL, "WEBHOOK_BASE_URL или RENDER_EXTERNAL_URL должны быть заданы"
