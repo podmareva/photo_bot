@@ -469,13 +469,28 @@ async def generate_result(message: Message, state: FSMContext):
 
         for i in range(n_variants):
             await msg.edit_text(f"Шаг 2/3: Генерирую сцену ({i+1}/{n_variants})...")
+            
+            # --- START OF MODIFICATION ---
+            # Simplified prompt mapping to avoid blacklisted words
+            prompt_map = {
+                "Каталог: чистый студийный фон, мягкая тень": "Clean studio background with a soft shadow",
+                "Минимализм: однотон, мягкие тени": "Minimalist solid color background, soft shadows",
+                "Тёмный премиум: low-key, контровый свет": "Dark premium look, low-key, backlit",
+                "Мрамор/глянец: контролируемые блики": "Glossy marble surface with controlled reflections",
+                "Nature: дерево/лен/зелень, дневной свет": "Natural scene with wood, linen, greenery, daylight",
+                "Flat lay: вид сверху, минимум пропсов": "Flat lay scene, top-down view, minimal props"
+            }
+            # Use the mapped prompt if it's a preset, otherwise use the user's text
+            simple_prompt = prompt_map.get(style_text, style_text)
+            
             # 2) Генерируем фон
             if placement == Placement.STUDIO.value:
-                prompt = f"{style_text}. Background only, no product. photorealistic, studio lighting, realistic textures, no text."
+                prompt = f"Background for product photography. {simple_prompt}. Photorealistic, cinematic lighting, realistic textures. No objects, no text, just the background."
             elif placement == Placement.ON_BODY.value:
-                prompt = f"{style_text}. photorealistic human portrait, neutral background, visible neck and collarbone, soft diffused light, shallow depth of field, natural skin tones, allow central empty area for necklace, no text."
+                prompt = f"{simple_prompt}. photorealistic human portrait, neutral background, visible neck and collarbone, soft diffused light, shallow depth of field, natural skin tones, allow central empty area for necklace, no text."
             else:  # IN_HAND
-                prompt = f"{style_text}. photorealistic hands close-up, neutral background, soft window light, macro-friendly composition, allow central empty area for product, no text."
+                prompt = f"{simple_prompt}. photorealistic hands close-up, neutral background, soft window light, macro-friendly composition, allow central empty area for product, no text."
+            # --- END OF MODIFICATION ---
 
             bg = generate_background(prompt, size=openai_size)
             bg = center_crop_to_aspect(bg, size_aspect)
