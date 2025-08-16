@@ -188,8 +188,8 @@ def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
 
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     """
-    Отправляет запрос в Pixelcut, перебирая возможные заголовки авторизации
-    и имена поля с файлом, чтобы найти рабочую комбинацию.
+    Отправляет запрос в Pixelcut, перебирая все известные способы авторизации
+    и все возможные имена поля с файлом.
     """
     endpoint = os.getenv("PIXELCUT_ENDPOINT", "").strip()
     key = os.getenv("PIXELCUT_API_KEY", "").strip()
@@ -203,22 +203,34 @@ def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     if len(jpg) < 2048:
         raise RuntimeError("После конвертации в JPEG файл слишком маленький")
 
+    # Список всех возможных заголовков авторизации для ключа sk_...
     headers_list = [
-        {"X-API-Key": key},
-        {"Authorization": f"Bearer {key}"},
+        {"X-API-Key": key},                          # Стандартный заголовок API-ключа
+        {"Authorization": key},                       # Ключ напрямую в заголовке Authorization
+        {"Authorization": f"Token {key}"},          # Схема "Token"
+        {"Authorization": f"ApiKey {key}"},         # Схема "ApiKey"
     ]
+    # Добавляем схему Bearer только если ключ вдруг похож на JWT
+    if '.' in key:
+        headers_list.append({"Authorization": f"Bearer {key}"})
+
     field_names = ["image", "image_file", "file", "file_upload"]
     last_detail = "Не удалось связаться с API"
 
     for hdr in headers_list:
+        auth_header_name = list(hdr.keys())[0]
+        auth_header_value = list(hdr.values())[0]
+        logging.info("="*50)
+        logging.info("Пробую новый заголовок: %s: %s...", auth_header_name, auth_header_value[:10] + "...")
+        
         for field in field_names:
             files = {field: ("input.jpg", BytesIO(jpg), "image/jpeg")}
             try:
-                logging.info("Pixelcut: пробую header=%s, field=%s", list(hdr.keys())[0], field)
+                logging.info("Pixelcut: пробую header=%s, field=%s", auth_header_name, field)
                 r = requests.post(endpoint, headers=hdr, files=files, timeout=120)
 
                 if r.status_code == 200:
-                    logging.info("Pixelcut: Успех с header=%s, field=%s", list(hdr.keys())[0], field)
+                    logging.info("✅✅✅ Pixelcut: УСПЕХ с header=%s, field=%s", auth_header_name, field)
                     return r.content
 
                 try:
@@ -226,24 +238,25 @@ def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
                 except Exception:
                     detail = r.text
                 
-                last_detail = f"{r.status_code}: {detail}"
-                logging.warning("Pixelcut: %s при header=%s, field=%s: %s", r.status_code, list(hdr.keys())[0], field, detail)
-
-                # Если ошибка связана с отсутствием файла или неверным параметром, пробуем следующую комбинацию
-                if r.status_code == 400 and any(
-                    s in str(detail).lower()
-                    for s in ["unsupported", "missing", "invalid_parameter", "image file is missing"]
-                ):
-                    continue
+                last_detail = f"({r.status_code}) {detail}"
+                logging.warning("Pixelcut: (%s) при header=%s, field=%s: %s", r.status_code, auth_header_name, field, detail)
                 
-                # Иные ошибки (401/403/5xx) — сразу сообщаем пользователю
-                raise RuntimeError(f"Ошибка Pixelcut: {last_detail}")
+                # Если ошибка авторизации, нет смысла пробовать другие поля, переходим к следующему заголовку
+                if r.status_code in [401, 403]:
+                    last_detail = f"Ошибка авторизации ({r.status_code}) с заголовком '{auth_header_name}'"
+                    break # Прерываем внутренний цикл по полям
+
+                # Если ошибка в параметрах, пробуем следующее поле
+                if r.status_code == 400:
+                    continue
 
             except requests.RequestException as e:
                 last_detail = f"Ошибка сети: {e}"
-                logging.error("Pixelcut network error with header=%s field=%s: %s", list(hdr.keys())[0], field, e)
+                logging.error("Pixelcut network error with header=%s field=%s: %s", auth_header_name, field, e)
+                # Если ошибка сети, нет смысла продолжать
+                raise RuntimeError(f"Ошибка Pixelcut: {last_detail}")
 
-    raise RuntimeError(f"Ошибка Pixelcut: не удалось подобрать параметры запроса. Последний ответ: {last_detail}")
+    raise RuntimeError(f"Не удалось авторизоваться в Pixelcut. Перепробовал все способы. Последняя ошибка: {last_detail}. Проверь API-ключ и эндпоинт.")
 
 
 # ====== Image Generation ======
