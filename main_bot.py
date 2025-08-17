@@ -364,4 +364,156 @@ async def on_start(message: Message, state: FSMContext):
     await message.answer(WELCOME, reply_markup=START_KB)
     await state.set_state(GenStates.waiting_start)
 
-@router.message(GenStates.waiting_start, F.text == "📓 Шпаргалка по п
+@router.message(GenStates.waiting_start, F.text == "📓 Шпаргалка по промтам")
+async def send_cheatsheet(message: Message, state: FSMContext):
+    ensure_prompts_file()
+    try:
+        await message.answer_document(FSInputFile(PROMPTS_FILE))
+    except Exception:
+        await message.answer("⚠️ Файл со шпаргалкой пока недоступен.")
+
+@router.message(GenStates.waiting_start, F.text.casefold() == "старт")
+async def pressed_start(message: Message, state: FSMContext):
+    await message.answer(REQUIREMENTS)
+    try:
+        await message.answer_document(FSInputFile(PROMPTS_FILE), caption="📓 Шпаргалка по промптам")
+    except Exception:
+        pass
+    await message.answer("Пришли фото товара (лучше как Документ).")
+    await state.set_state(GenStates.waiting_photo)
+
+@router.message(GenStates.waiting_photo, F.document | F.photo)
+async def got_photo(message: Message, state: FSMContext):
+    try:
+        image_bytes, file_id = await download_bytes_from_message(bot, message)
+        await state.update_data(image=image_bytes, image_file_id=file_id)
+        await message.answer("Выбери расположение товара:", reply_markup=PLACEMENT_KB)
+        await state.set_state(GenStates.waiting_placement)
+    except Exception as e:
+        logging.error(f"Error processing photo: {e}")
+        await message.answer("Не удалось обработать фото. Попробуй другое.")
+
+@router.message(GenStates.waiting_placement, F.text)
+async def choose_placement(message: Message, state: FSMContext):
+    val = (message.text or "").strip()
+    if val not in (Placement.STUDIO.value, Placement.ON_BODY.value, Placement.IN_HAND.value):
+        await message.answer("Выбери один из вариантов с помощью клавиатуры.")
+        return
+    await state.update_data(placement=val)
+    await message.answer("Выбери размер (соотношение сторон):", reply_markup=SIZE_KB)
+    await state.set_state(GenStates.waiting_size)
+
+@router.message(GenStates.waiting_size, F.text)
+async def choose_size(message: Message, state: FSMContext):
+    size = (message.text or "").strip()
+    if size not in {"1:1", "4:5", "3:4", "16:9", "9:16"}:
+        await message.answer("Выбери один из вариантов на клавиатуре.")
+        return
+    await state.update_data(size_aspect=size)
+    await message.answer("Сколько вариантов сделать за один раз?", reply_markup=VAR_KB)
+    await state.set_state(GenStates.waiting_variants)
+
+@router.message(GenStates.waiting_variants, F.text)
+async def choose_variants(message: Message, state: FSMContext):
+    try:
+        n = int((message.text or "1").strip())
+        n = max(1, min(5, n))
+    except ValueError:
+        n = 1
+    await state.update_data(n_variants=n)
+    txt = (
+        "Выбери сцену или опиши свою.\n\n"
+        "• Studio — clean background, soft gradient, subtle shadow\n"
+        "• Lifestyle — warm interior, wood/linen, soft window light\n"
+        "• Luxury — glossy stone, controlled highlights, dark backdrop"
+    )
+    await message.answer(txt, reply_markup=STYLE_KB)
+    await state.set_state(GenStates.waiting_style)
+
+@router.message(GenStates.waiting_style, F.text)
+async def generate_result(message: Message, state: FSMContext):
+    style_text = (message.text or "").strip()
+    await state.update_data(style=style_text)
+    await message.answer("Принято! Начинаю магию ✨\nЭто может занять 1-2 минуты...", reply_markup=None)
+
+    try:
+        data = await state.get_data()
+        image_bytes: Optional[bytes] = data.get("image")
+        if not image_bytes:
+            src_id = data.get("image_file_id")
+            if not src_id:
+                await message.answer("Не нашел исходное фото. Пожалуйста, начни заново с /start")
+                return
+            image_bytes = await load_bytes_by_file_id(bot, src_id)
+            await state.update_data(image=image_bytes)
+
+        placement = data.get("placement", Placement.STUDIO.value)
+        size_aspect = data.get("size_aspect", "1:1")
+        n_variants = int(data.get("n_variants", 1))
+        openai_size = pick_openai_size(size_aspect)
+
+        # 1) Вырезаем фон
+        msg = await message.answer("Шаг 1/3: Удаляю фон с твоего фото...")
+        cut_png = await remove_bg_pixelcut(image_bytes) # ИЗМЕНЕНО: Добавлен await
+
+        for i in range(n_variants):
+            await msg.edit_text(f"Шаг 2/3: Генерирую сцену ({i+1}/{n_variants})...")
+            # 2) Генерируем фон
+            if placement == Placement.STUDIO.value:
+                prompt = f"{style_text}. Background only, no product. photorealistic, studio lighting, realistic textures, no text."
+            elif placement == Placement.ON_BODY.value:
+                prompt = f"{style_text}. photorealistic human portrait, neutral background, visible neck and collarbone, soft diffused light, shallow depth of field, natural skin tones, allow central empty area for necklace, no text."
+            else:  # IN_HAND
+                prompt = f"{style_text}. photorealistic hands close-up, neutral background, soft window light, macro-friendly composition, allow central empty area for product, no text."
+
+            bg = generate_background(prompt, size=openai_size)
+            bg = center_crop_to_aspect(bg, size_aspect)
+
+            await msg.edit_text(f"Шаг 3/3: Совмещаю товар и фон ({i+1}/{n_variants})...")
+            # 3) Компонуем
+            if placement == Placement.STUDIO.value:
+                result = compose_subject_on_bg(cut_png, bg, scale_by_height=0.74, x_shift=0.0, y_shift=-0.06)
+            elif placement == Placement.ON_BODY.value:
+                bw, bh = bg.size
+                result = seamless_place(cut_png, bg, scale_by_height=0.26, x=int(bw*0.5), y=int(bh*0.38))
+            else: # IN_HAND
+                bw, bh = bg.size
+                result = seamless_place(cut_png, bg, scale_by_height=0.40, x=int(bw*0.5), y=int(bh*0.5))
+
+            # 4) Отправляем результат
+            buf = io.BytesIO()
+            result.save(buf, format="PNG")
+            data_bytes = buf.getvalue()
+            filename = f"result_{i+1}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png"
+            await message.answer_document(BufferedInputFile(data_bytes, filename), caption=f"Вариант {i+1}/{n_variants}")
+
+        await msg.delete()
+        await state.clear()
+        await message.answer("✅ Готово! Можешь прислать следующее фото или нажми /start для смены настроек.", reply_markup=START_KB)
+        await state.set_state(GenStates.waiting_start)
+
+    except Exception as e:
+        logging.exception("Generation error")
+        await message.answer(f"Что-то пошло не так 😥\nОшибка: {e}\n\nПопробуй ещё раз или начни с /start.")
+        # Стейт не чистим, чтобы можно было повторить/исправить
+
+# === Webhook server ===
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
+assert BASE_URL, "WEBHOOK_BASE_URL или RENDER_EXTERNAL_URL должны быть заданы"
+WEBHOOK_URL = BASE_URL + WEBHOOK_PATH
+
+async def on_startup_app(app: web.Application):
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    await _log_bot_info()
+
+async def on_shutdown_app(app: web.Application):
+    await bot.delete_webhook()
+    await bot.session.close()
+
+app = web.Application()
+SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_app)
+
+if __name__ == "__main__":
+    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
