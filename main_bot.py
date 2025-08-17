@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import requests
-import urllib3 # Добавлено для управления предупреждениями SSL
+import aiohttp # Добавлена новая библиотека для запросов
 from PIL import Image, ImageFilter
 import numpy as np
 import cv2
@@ -186,10 +186,10 @@ def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
     img.save(buf, format="JPEG", quality=95, optimize=True)
     return buf.getvalue()
 
-def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
+async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     """
-    Отправляет запрос в Pixelcut. Если DNS-запрос не удаётся,
-    пробует подключиться напрямую по IP-адресу.
+    Отправляет асинхронный запрос в Pixelcut с использованием aiohttp
+    для лучшей работы в облачных средах.
     """
     key = os.getenv("PIXELCUT_API_KEY", "").strip()
     if not key:
@@ -200,54 +200,39 @@ def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
 
     endpoint = "https://api.pixelcut.ai/v1/remove-background"
     headers = {"X-API-Key": key}
-    files = {"image": ("input.jpg", BytesIO(jpg_bytes), "image/jpeg")}
+    
+    data = aiohttp.FormData()
+    data.add_field('image',
+                   BytesIO(jpg_bytes),
+                   filename='input.jpg',
+                   content_type='image/jpeg')
 
-    try:
-        logging.info(f"Pixelcut: Попытка запроса к {endpoint}...")
-        response = requests.post(endpoint, headers=headers, files=files, timeout=120)
-        response.raise_for_status()  # Вызовет ошибку для статусов 4xx/5xx
-        logging.info("Pixelcut: Фон успешно удален через доменное имя.")
-        return response.content
+    timeout = aiohttp.ClientTimeout(total=120)
 
-    except requests.exceptions.RequestException as e:
-        logging.warning(f"Pixelcut: Первая попытка запроса не удалась: {e}")
-        
-        # Проверяем, является ли ошибка проблемой разрешения DNS
-        if "Failed to resolve" in str(e) or "Name or service not known" in str(e):
-            logging.info("Pixelcut: Ошибка разрешения DNS. Пробую запасной вариант с прямым IP.")
-            
-            # --- Логика запасного варианта ---
-            fallback_ip = "104.18.1.175"  # Один из известных IP для api.pixelcut.ai
-            fallback_endpoint = f"https://{fallback_ip}/v1/remove-background"
-            fallback_headers = headers.copy()
-            fallback_headers['Host'] = 'api.pixelcut.ai'
-            
-            try:
-                logging.info(f"Pixelcut: Отправляю запасной запрос на {fallback_endpoint}...")
-                # Отключаем проверку сертификата, т.к. он выдан для домена, а не для IP
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                
-                response = requests.post(fallback_endpoint, headers=fallback_headers, files=files, timeout=120, verify=False)
-                
-                if response.status_code == 200:
-                    logging.info("Pixelcut: Фон успешно удален через запасной IP.")
-                    return response.content
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            logging.info(f"Pixelcut: Отправляю aiohttp запрос на {endpoint}...")
+            async with session.post(endpoint, headers=headers, data=data) as response:
+                if response.status == 200:
+                    logging.info("Pixelcut: Фон успешно удален через aiohttp.")
+                    return await response.read()
                 else:
-                    error_message = f"Запасной вариант с IP также провалился (статус {response.status_code}): {response.text}"
+                    try:
+                        detail = await response.json()
+                    except Exception:
+                        detail = await response.text()
+                    
+                    error_message = f"Ошибка от API Pixelcut (статус {response.status}): {detail}"
                     logging.error(error_message)
+                    
+                    if response.status == 401:
+                        raise RuntimeError("Ошибка авторизации (401) в Pixelcut. Проверьте правильность вашего API-ключа.")
+                    
                     raise RuntimeError(error_message)
 
-            except requests.RequestException as fallback_e:
-                logging.error(f"Pixelcut: Запасной запрос по IP не удался: {fallback_e}")
-                raise RuntimeError(f"Не удалось подключиться к сервису ни по домену, ни по IP: {fallback_e}")
-        
-        # Если это была другая ошибка (например, 401), создаем более понятное сообщение
-        if isinstance(e, requests.exceptions.HTTPError):
-            if e.response.status_code == 401:
-                raise RuntimeError("Ошибка авторизации (401) в Pixelcut. Проверьте правильность вашего API-ключа.")
-        
-        # Для всех остальных сетевых ошибок
-        raise RuntimeError(f"Не удалось подключиться к сервису удаления фона: {e}")
+        except aiohttp.ClientError as e:
+            logging.error(f"Сетевая ошибка aiohttp при обращении к Pixelcut: {e}")
+            raise RuntimeError(f"Не удалось подключиться к сервису удаления фона: {e}")
 
 
 # ====== Image Generation ======
@@ -379,156 +364,4 @@ async def on_start(message: Message, state: FSMContext):
     await message.answer(WELCOME, reply_markup=START_KB)
     await state.set_state(GenStates.waiting_start)
 
-@router.message(GenStates.waiting_start, F.text == "📓 Шпаргалка по промтам")
-async def send_cheatsheet(message: Message, state: FSMContext):
-    ensure_prompts_file()
-    try:
-        await message.answer_document(FSInputFile(PROMPTS_FILE))
-    except Exception:
-        await message.answer("⚠️ Файл со шпаргалкой пока недоступен.")
-
-@router.message(GenStates.waiting_start, F.text.casefold() == "старт")
-async def pressed_start(message: Message, state: FSMContext):
-    await message.answer(REQUIREMENTS)
-    try:
-        await message.answer_document(FSInputFile(PROMPTS_FILE), caption="📓 Шпаргалка по промптам")
-    except Exception:
-        pass
-    await message.answer("Пришли фото товара (лучше как Документ).")
-    await state.set_state(GenStates.waiting_photo)
-
-@router.message(GenStates.waiting_photo, F.document | F.photo)
-async def got_photo(message: Message, state: FSMContext):
-    try:
-        image_bytes, file_id = await download_bytes_from_message(bot, message)
-        await state.update_data(image=image_bytes, image_file_id=file_id)
-        await message.answer("Выбери расположение товара:", reply_markup=PLACEMENT_KB)
-        await state.set_state(GenStates.waiting_placement)
-    except Exception as e:
-        logging.error(f"Error processing photo: {e}")
-        await message.answer("Не удалось обработать фото. Попробуй другое.")
-
-@router.message(GenStates.waiting_placement, F.text)
-async def choose_placement(message: Message, state: FSMContext):
-    val = (message.text or "").strip()
-    if val not in (Placement.STUDIO.value, Placement.ON_BODY.value, Placement.IN_HAND.value):
-        await message.answer("Выбери один из вариантов с помощью клавиатуры.")
-        return
-    await state.update_data(placement=val)
-    await message.answer("Выбери размер (соотношение сторон):", reply_markup=SIZE_KB)
-    await state.set_state(GenStates.waiting_size)
-
-@router.message(GenStates.waiting_size, F.text)
-async def choose_size(message: Message, state: FSMContext):
-    size = (message.text or "").strip()
-    if size not in {"1:1", "4:5", "3:4", "16:9", "9:16"}:
-        await message.answer("Выбери один из вариантов на клавиатуре.")
-        return
-    await state.update_data(size_aspect=size)
-    await message.answer("Сколько вариантов сделать за один раз?", reply_markup=VAR_KB)
-    await state.set_state(GenStates.waiting_variants)
-
-@router.message(GenStates.waiting_variants, F.text)
-async def choose_variants(message: Message, state: FSMContext):
-    try:
-        n = int((message.text or "1").strip())
-        n = max(1, min(5, n))
-    except ValueError:
-        n = 1
-    await state.update_data(n_variants=n)
-    txt = (
-        "Выбери сцену или опиши свою.\n\n"
-        "• Studio — clean background, soft gradient, subtle shadow\n"
-        "• Lifestyle — warm interior, wood/linen, soft window light\n"
-        "• Luxury — glossy stone, controlled highlights, dark backdrop"
-    )
-    await message.answer(txt, reply_markup=STYLE_KB)
-    await state.set_state(GenStates.waiting_style)
-
-@router.message(GenStates.waiting_style, F.text)
-async def generate_result(message: Message, state: FSMContext):
-    style_text = (message.text or "").strip()
-    await state.update_data(style=style_text)
-    await message.answer("Принято! Начинаю магию ✨\nЭто может занять 1-2 минуты...", reply_markup=None)
-
-    try:
-        data = await state.get_data()
-        image_bytes: Optional[bytes] = data.get("image")
-        if not image_bytes:
-            src_id = data.get("image_file_id")
-            if not src_id:
-                await message.answer("Не нашел исходное фото. Пожалуйста, начни заново с /start")
-                return
-            image_bytes = await load_bytes_by_file_id(bot, src_id)
-            await state.update_data(image=image_bytes)
-
-        placement = data.get("placement", Placement.STUDIO.value)
-        size_aspect = data.get("size_aspect", "1:1")
-        n_variants = int(data.get("n_variants", 1))
-        openai_size = pick_openai_size(size_aspect)
-
-        # 1) Вырезаем фон
-        msg = await message.answer("Шаг 1/3: Удаляю фон с твоего фото...")
-        cut_png = remove_bg_pixelcut(image_bytes)
-
-        for i in range(n_variants):
-            await msg.edit_text(f"Шаг 2/3: Генерирую сцену ({i+1}/{n_variants})...")
-            # 2) Генерируем фон
-            if placement == Placement.STUDIO.value:
-                prompt = f"{style_text}. Background only, no product. photorealistic, studio lighting, realistic textures, no text."
-            elif placement == Placement.ON_BODY.value:
-                prompt = f"{style_text}. photorealistic human portrait, neutral background, visible neck and collarbone, soft diffused light, shallow depth of field, natural skin tones, allow central empty area for necklace, no text."
-            else:  # IN_HAND
-                prompt = f"{style_text}. photorealistic hands close-up, neutral background, soft window light, macro-friendly composition, allow central empty area for product, no text."
-
-            bg = generate_background(prompt, size=openai_size)
-            bg = center_crop_to_aspect(bg, size_aspect)
-
-            await msg.edit_text(f"Шаг 3/3: Совмещаю товар и фон ({i+1}/{n_variants})...")
-            # 3) Компонуем
-            if placement == Placement.STUDIO.value:
-                result = compose_subject_on_bg(cut_png, bg, scale_by_height=0.74, x_shift=0.0, y_shift=-0.06)
-            elif placement == Placement.ON_BODY.value:
-                bw, bh = bg.size
-                result = seamless_place(cut_png, bg, scale_by_height=0.26, x=int(bw*0.5), y=int(bh*0.38))
-            else: # IN_HAND
-                bw, bh = bg.size
-                result = seamless_place(cut_png, bg, scale_by_height=0.40, x=int(bw*0.5), y=int(bh*0.5))
-
-            # 4) Отправляем результат
-            buf = io.BytesIO()
-            result.save(buf, format="PNG")
-            data_bytes = buf.getvalue()
-            filename = f"result_{i+1}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png"
-            await message.answer_document(BufferedInputFile(data_bytes, filename), caption=f"Вариант {i+1}/{n_variants}")
-
-        await msg.delete()
-        await state.clear()
-        await message.answer("✅ Готово! Можешь прислать следующее фото или нажми /start для смены настроек.", reply_markup=START_KB)
-        await state.set_state(GenStates.waiting_start)
-
-    except Exception as e:
-        logging.exception("Generation error")
-        await message.answer(f"Что-то пошло не так 😥\nОшибка: {e}\n\nПопробуй ещё раз или начни с /start.")
-        # Стейт не чистим, чтобы можно было повторить/исправить
-
-# === Webhook server ===
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
-assert BASE_URL, "WEBHOOK_BASE_URL или RENDER_EXTERNAL_URL должны быть заданы"
-WEBHOOK_URL = BASE_URL + WEBHOOK_PATH
-
-async def on_startup_app(app: web.Application):
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-    await _log_bot_info()
-
-async def on_shutdown_app(app: web.Application):
-    await bot.delete_webhook()
-    await bot.session.close()
-
-app = web.Application()
-SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_app)
-
-if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+@router.message(GenStates.waiting_start, F.text == "📓 Шпаргалка по п
