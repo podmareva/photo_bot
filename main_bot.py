@@ -33,8 +33,7 @@ from io import BytesIO
 # ========= ENV / CONFIG =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PIXELCUT_API_KEY = os.getenv("PIXELCUT_API_KEY", "").strip()
-PIXELCUT_ENDPOINT = os.getenv("PIXELCUT_ENDPOINT", "https://api.developer.pixelcut.ai/v1/remove-background")
+PIXELCUT_API_KEY = os.getenv("PIXELCUT_API_KEY", "").strip() # ВАЖНО: Убедись, что этот ключ правильный!
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 MAIN_BOT_USERNAME = os.getenv("MAIN_BOT_USERNAME", "")
@@ -188,75 +187,53 @@ def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
 
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     """
-    Отправляет запрос в Pixelcut, перебирая все известные способы авторизации
-    и все возможные имена поля с файлом.
+    Отправляет запрос в Pixelcut для удаления фона.
+    Использует метод, указанный в официальной документации.
     """
-    endpoint = os.getenv("PIXELCUT_ENDPOINT", "").strip()
+    # 1. Проверяем переменные окружения и задаем правильный эндпоинт
+    endpoint = "https://api.pixelcut.ai/v1/remove-background"  # ИСПРАВЛЕНО: Правильный эндпоинт без 'developer'
     key = os.getenv("PIXELCUT_API_KEY", "").strip()
-    if not endpoint:
-        raise RuntimeError("PIXELCUT_ENDPOINT не задан")
+    
     if not key:
-        raise RuntimeError("PIXELCUT_API_KEY не задан")
+        raise RuntimeError("PIXELCUT_API_KEY не задан в переменных окружения.")
 
+    # 2. Валидация и подготовка изображения
     _validate_image_bytes(image_bytes)
-    jpg = ensure_jpg_bytes(image_bytes)
-    if len(jpg) < 2048:
-        raise RuntimeError("После конвертации в JPEG файл слишком маленький")
+    jpg_bytes = ensure_jpg_bytes(image_bytes)
+    if len(jpg_bytes) < 1024:
+        raise RuntimeError("После конвертации в JPEG файл слишком маленький (<1KB)")
 
-    # Список всех возможных заголовков авторизации для ключа sk_...
-    headers_list = [
-        {"X-API-Key": key},                          # Стандартный заголовок API-ключа
-        {"Authorization": key},                       # Ключ напрямую в заголовке Authorization
-        {"Authorization": f"Token {key}"},          # Схема "Token"
-        {"Authorization": f"ApiKey {key}"},         # Схема "ApiKey"
-    ]
-    # Добавляем схему Bearer только если ключ вдруг похож на JWT
-    if '.' in key:
-        headers_list.append({"Authorization": f"Bearer {key}"})
+    # 3. Формирование запроса согласно документации
+    headers = {"X-API-Key": key}
+    files = {"image": ("input.jpg", BytesIO(jpg_bytes), "image/jpeg")}
+    
+    logging.info(f"Pixelcut: Отправляю запрос на {endpoint}...")
 
-    field_names = ["image", "image_file", "file", "file_upload"]
-    last_detail = "Не удалось связаться с API"
+    try:
+        response = requests.post(endpoint, headers=headers, files=files, timeout=120)
 
-    for hdr in headers_list:
-        auth_header_name = list(hdr.keys())[0]
-        auth_header_value = list(hdr.values())[0]
-        logging.info("="*50)
-        logging.info("Пробую новый заголовок: %s: %s...", auth_header_name, auth_header_value[:10] + "...")
-        
-        for field in field_names:
-            files = {field: ("input.jpg", BytesIO(jpg), "image/jpeg")}
+        # 4. Обработка ответа
+        if response.status_code == 200:
+            logging.info("Pixelcut: Успешно удален фон.")
+            return response.content
+        else:
+            # Попытка получить детальную ошибку из ответа
             try:
-                logging.info("Pixelcut: пробую header=%s, field=%s", auth_header_name, field)
-                r = requests.post(endpoint, headers=hdr, files=files, timeout=120)
+                detail = response.json()
+            except Exception:
+                detail = response.text
+            
+            error_message = f"Ошибка от API Pixelcut (статус {response.status_code}): {detail}"
+            logging.error(error_message)
+            
+            if response.status_code == 401:
+                raise RuntimeError("Ошибка авторизации (401) в Pixelcut. Проверьте правильность вашего API-ключа.")
+            
+            raise RuntimeError(error_message)
 
-                if r.status_code == 200:
-                    logging.info("✅✅✅ Pixelcut: УСПЕХ с header=%s, field=%s", auth_header_name, field)
-                    return r.content
-
-                try:
-                    detail = r.json()
-                except Exception:
-                    detail = r.text
-                
-                last_detail = f"({r.status_code}) {detail}"
-                logging.warning("Pixelcut: (%s) при header=%s, field=%s: %s", r.status_code, auth_header_name, field, detail)
-                
-                # Если ошибка авторизации, нет смысла пробовать другие поля, переходим к следующему заголовку
-                if r.status_code in [401, 403]:
-                    last_detail = f"Ошибка авторизации ({r.status_code}) с заголовком '{auth_header_name}'"
-                    break # Прерываем внутренний цикл по полям
-
-                # Если ошибка в параметрах, пробуем следующее поле
-                if r.status_code == 400:
-                    continue
-
-            except requests.RequestException as e:
-                last_detail = f"Ошибка сети: {e}"
-                logging.error("Pixelcut network error with header=%s field=%s: %s", auth_header_name, field, e)
-                # Если ошибка сети, нет смысла продолжать
-                raise RuntimeError(f"Ошибка Pixelcut: {last_detail}")
-
-    raise RuntimeError(f"Не удалось авторизоваться в Pixelcut. Перепробовал все способы. Последняя ошибка: {last_detail}. Проверь API-ключ и эндпоинт.")
+    except requests.RequestException as e:
+        logging.error(f"Сетевая ошибка при обращении к Pixelcut: {e}")
+        raise RuntimeError(f"Не удалось подключиться к сервису удаления фона: {e}")
 
 
 # ====== Image Generation ======
@@ -482,28 +459,13 @@ async def generate_result(message: Message, state: FSMContext):
 
         for i in range(n_variants):
             await msg.edit_text(f"Шаг 2/3: Генерирую сцену ({i+1}/{n_variants})...")
-            
-            # --- START OF MODIFICATION ---
-            # Simplified prompt mapping to avoid blacklisted words
-            prompt_map = {
-                "Каталог: чистый студийный фон, мягкая тень": "Clean studio background with a soft shadow",
-                "Минимализм: однотон, мягкие тени": "Minimalist solid color background, soft shadows",
-                "Тёмный премиум: low-key, контровый свет": "Dark premium look, low-key, backlit",
-                "Мрамор/глянец: контролируемые блики": "Glossy marble surface with controlled reflections",
-                "Nature: дерево/лен/зелень, дневной свет": "Natural scene with wood, linen, greenery, daylight",
-                "Flat lay: вид сверху, минимум пропсов": "Flat lay scene, top-down view, minimal props"
-            }
-            # Use the mapped prompt if it's a preset, otherwise use the user's text
-            simple_prompt = prompt_map.get(style_text, style_text)
-            
             # 2) Генерируем фон
             if placement == Placement.STUDIO.value:
-                prompt = f"Background for product photography. {simple_prompt}. Photorealistic, cinematic lighting, realistic textures. No objects, no text, just the background."
+                prompt = f"{style_text}. Background only, no product. photorealistic, studio lighting, realistic textures, no text."
             elif placement == Placement.ON_BODY.value:
-                prompt = f"{simple_prompt}. photorealistic human portrait, neutral background, visible neck and collarbone, soft diffused light, shallow depth of field, natural skin tones, allow central empty area for necklace, no text."
+                prompt = f"{style_text}. photorealistic human portrait, neutral background, visible neck and collarbone, soft diffused light, shallow depth of field, natural skin tones, allow central empty area for necklace, no text."
             else:  # IN_HAND
-                prompt = f"{simple_prompt}. photorealistic hands close-up, neutral background, soft window light, macro-friendly composition, allow central empty area for product, no text."
-            # --- END OF MODIFICATION ---
+                prompt = f"{style_text}. photorealistic hands close-up, neutral background, soft window light, macro-friendly composition, allow central empty area for product, no text."
 
             bg = generate_background(prompt, size=openai_size)
             bg = center_crop_to_aspect(bg, size_aspect)
