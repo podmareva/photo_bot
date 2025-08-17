@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import requests
+import urllib3 # Добавлено для управления предупреждениями SSL
 from PIL import Image, ImageFilter
 import numpy as np
 import cv2
@@ -187,52 +188,65 @@ def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
 
 def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     """
-    Отправляет запрос в Pixelcut для удаления фона.
-    Использует метод, указанный в официальной документации.
+    Отправляет запрос в Pixelcut. Если DNS-запрос не удаётся,
+    пробует подключиться напрямую по IP-адресу.
     """
-    # 1. Проверяем переменные окружения и задаем правильный эндпоинт
-    endpoint = "https://api.pixelcut.ai/v1/remove-background"  # ИСПРАВЛЕНО: Правильный эндпоинт без 'developer'
     key = os.getenv("PIXELCUT_API_KEY", "").strip()
-    
     if not key:
         raise RuntimeError("PIXELCUT_API_KEY не задан в переменных окружения.")
 
-    # 2. Валидация и подготовка изображения
     _validate_image_bytes(image_bytes)
     jpg_bytes = ensure_jpg_bytes(image_bytes)
-    if len(jpg_bytes) < 1024:
-        raise RuntimeError("После конвертации в JPEG файл слишком маленький (<1KB)")
 
-    # 3. Формирование запроса согласно документации
+    endpoint = "https://api.pixelcut.ai/v1/remove-background"
     headers = {"X-API-Key": key}
     files = {"image": ("input.jpg", BytesIO(jpg_bytes), "image/jpeg")}
-    
-    logging.info(f"Pixelcut: Отправляю запрос на {endpoint}...")
 
     try:
+        logging.info(f"Pixelcut: Попытка запроса к {endpoint}...")
         response = requests.post(endpoint, headers=headers, files=files, timeout=120)
+        response.raise_for_status()  # Вызовет ошибку для статусов 4xx/5xx
+        logging.info("Pixelcut: Фон успешно удален через доменное имя.")
+        return response.content
 
-        # 4. Обработка ответа
-        if response.status_code == 200:
-            logging.info("Pixelcut: Успешно удален фон.")
-            return response.content
-        else:
-            # Попытка получить детальную ошибку из ответа
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Pixelcut: Первая попытка запроса не удалась: {e}")
+        
+        # Проверяем, является ли ошибка проблемой разрешения DNS
+        if "Failed to resolve" in str(e) or "Name or service not known" in str(e):
+            logging.info("Pixelcut: Ошибка разрешения DNS. Пробую запасной вариант с прямым IP.")
+            
+            # --- Логика запасного варианта ---
+            fallback_ip = "104.18.1.175"  # Один из известных IP для api.pixelcut.ai
+            fallback_endpoint = f"https://{fallback_ip}/v1/remove-background"
+            fallback_headers = headers.copy()
+            fallback_headers['Host'] = 'api.pixelcut.ai'
+            
             try:
-                detail = response.json()
-            except Exception:
-                detail = response.text
-            
-            error_message = f"Ошибка от API Pixelcut (статус {response.status_code}): {detail}"
-            logging.error(error_message)
-            
-            if response.status_code == 401:
-                raise RuntimeError("Ошибка авторизации (401) в Pixelcut. Проверьте правильность вашего API-ключа.")
-            
-            raise RuntimeError(error_message)
+                logging.info(f"Pixelcut: Отправляю запасной запрос на {fallback_endpoint}...")
+                # Отключаем проверку сертификата, т.к. он выдан для домена, а не для IP
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                
+                response = requests.post(fallback_endpoint, headers=fallback_headers, files=files, timeout=120, verify=False)
+                
+                if response.status_code == 200:
+                    logging.info("Pixelcut: Фон успешно удален через запасной IP.")
+                    return response.content
+                else:
+                    error_message = f"Запасной вариант с IP также провалился (статус {response.status_code}): {response.text}"
+                    logging.error(error_message)
+                    raise RuntimeError(error_message)
 
-    except requests.RequestException as e:
-        logging.error(f"Сетевая ошибка при обращении к Pixelcut: {e}")
+            except requests.RequestException as fallback_e:
+                logging.error(f"Pixelcut: Запасной запрос по IP не удался: {fallback_e}")
+                raise RuntimeError(f"Не удалось подключиться к сервису ни по домену, ни по IP: {fallback_e}")
+        
+        # Если это была другая ошибка (например, 401), создаем более понятное сообщение
+        if isinstance(e, requests.exceptions.HTTPError):
+            if e.response.status_code == 401:
+                raise RuntimeError("Ошибка авторизации (401) в Pixelcut. Проверьте правильность вашего API-ключа.")
+        
+        # Для всех остальных сетевых ошибок
         raise RuntimeError(f"Не удалось подключиться к сервису удаления фона: {e}")
 
 
