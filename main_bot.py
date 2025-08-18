@@ -5,6 +5,8 @@ import io
 import base64
 import logging
 import socket
+import asyncio
+import ssl
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -15,7 +17,6 @@ load_dotenv()
 
 import requests
 import aiohttp # Добавлена новая библиотека для запросов
-import aiodns # Добавлено для кастомного DNS
 from PIL import Image, ImageFilter
 import numpy as np
 import cv2
@@ -188,32 +189,28 @@ def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
     img.save(buf, format="JPEG", quality=95, optimize=True)
     return buf.getvalue()
 
-# ИЗМЕНЕНО: Добавлен специальный класс-резолвер для совместимости aiohttp и aiodns
-class CustomAiodnsResolver(aiohttp.resolver.AbstractResolver):
-    """Резолвер, который использует aiodns для разрешения хостов с кастомными DNS-серверами."""
-    def __init__(self, nameservers: List[str]):
-        self._resolver = aiodns.DNSResolver(nameservers=nameservers)
-
+# ИЗМЕНЕНО: Добавлен резолвер, использующий стандартную библиотеку socket в отдельном потоке
+class ThreadedResolver(aiohttp.resolver.AbstractResolver):
+    """Резолвер, который использует стандартный socket.getaddrinfo в пуле потоков."""
     async def resolve(self, host: str, port: int, family: int = socket.AF_INET) -> List[Dict[str, Any]]:
+        loop = asyncio.get_running_loop()
         try:
-            records = await self._resolver.query(host, 'A')
-        except aiodns.error.DNSError as e:
-            raise OSError(f"DNS resolution failed for {host}") from e
-
-        if not records:
-            raise OSError(f"No A records found for {host}")
-
-        return [
-            {
-                'hostname': host,
-                'host': record.host,
-                'port': port,
-                'family': family,
-                'proto': 0,
-                'flags': 0,
-            }
-            for record in records
-        ]
+            infos = await loop.run_in_executor(
+                None, socket.getaddrinfo, host, port, family, socket.SOCK_STREAM
+            )
+            hosts = []
+            for family, _, _, _, address in infos:
+                hosts.append({
+                    "hostname": host,
+                    "host": address[0],
+                    "port": address[1],
+                    "family": family,
+                    "proto": 0,
+                    "flags": socket.AI_NUMERICHOST,
+                })
+            return hosts
+        except socket.gaierror as e:
+            raise OSError(f"DNS resolution failed for host: {host}") from e
 
     async def close(self) -> None:
         pass
@@ -221,7 +218,7 @@ class CustomAiodnsResolver(aiohttp.resolver.AbstractResolver):
 
 async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     """
-    Отправляет асинхронный запрос в Pixelcut, используя кастомный DNS-резолвер
+    Отправляет асинхронный запрос в Pixelcut, используя надежный DNS-резолвер
     для обхода проблем с DNS на хостинге.
     """
     key = os.getenv("PIXELCUT_API_KEY", "").strip()
@@ -242,13 +239,14 @@ async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
 
     timeout = aiohttp.ClientTimeout(total=120)
     
-    # ИЗМЕНЕНО: Создаем коннектор с нашим кастомным резолвером
-    resolver = CustomAiodnsResolver(nameservers=['8.8.8.8', '1.1.1.1'])
-    connector = aiohttp.TCPConnector(resolver=resolver, ssl=False) # ssl=False может понадобиться на некоторых хостингах
+    # ИЗМЕНЕНО: Создаем коннектор с нашим новым надежным резолвером
+    resolver = ThreadedResolver()
+    ssl_context = ssl.create_default_context()
+    connector = aiohttp.TCPConnector(resolver=resolver, ssl=ssl_context)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         try:
-            logging.info(f"Pixelcut: Отправляю aiohttp запрос с кастомным DNS на {endpoint}...")
+            logging.info(f"Pixelcut: Отправляю aiohttp запрос с ThreadedResolver на {endpoint}...")
             async with session.post(endpoint, headers=headers, data=data) as response:
                 if response.status == 200:
                     logging.info("Pixelcut: Фон успешно удален.")
@@ -413,7 +411,7 @@ async def send_cheatsheet(message: Message, state: FSMContext):
 async def pressed_start(message: Message, state: FSMContext):
     await message.answer(REQUIREMENTS)
     try:
-        await message.answer_document(FSInputFile(PROMPTS_FILE), caption="📓 Шпаргалка по промтам")
+        await message.answer_document(FSInputFile(PROMPTS_FILE), caption="📓 Шпаргалка по промптам")
     except Exception:
         pass
     await message.answer("Пришли фото товара (лучше как Документ).")
