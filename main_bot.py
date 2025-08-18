@@ -14,6 +14,7 @@ load_dotenv()
 
 import requests
 import aiohttp # Добавлена новая библиотека для запросов
+import aiodns # Добавлено для кастомного DNS
 from PIL import Image, ImageFilter
 import numpy as np
 import cv2
@@ -188,8 +189,8 @@ def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
 
 async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     """
-    Отправляет асинхронный запрос в Pixelcut с использованием aiohttp
-    для лучшей работы в облачных средах.
+    Отправляет асинхронный запрос в Pixelcut, используя кастомный DNS-резолвер
+    для обхода проблем с DNS на хостинге.
     """
     key = os.getenv("PIXELCUT_API_KEY", "").strip()
     if not key:
@@ -208,13 +209,17 @@ async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
                    content_type='image/jpeg')
 
     timeout = aiohttp.ClientTimeout(total=120)
+    
+    # ИЗМЕНЕНО: Создаем коннектор с DNS от Google, чтобы обойти проблемы хостинга
+    resolver = aiodns.DNSResolver(nameservers=['8.8.8.8', '1.1.1.1'])
+    connector = aiohttp.TCPConnector(resolver=resolver)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         try:
-            logging.info(f"Pixelcut: Отправляю aiohttp запрос на {endpoint}...")
+            logging.info(f"Pixelcut: Отправляю aiohttp запрос с кастомным DNS на {endpoint}...")
             async with session.post(endpoint, headers=headers, data=data) as response:
                 if response.status == 200:
-                    logging.info("Pixelcut: Фон успешно удален через aiohttp.")
+                    logging.info("Pixelcut: Фон успешно удален.")
                     return await response.read()
                 else:
                     try:
@@ -454,7 +459,7 @@ async def generate_result(message: Message, state: FSMContext):
 
         # 1) Вырезаем фон
         msg = await message.answer("Шаг 1/3: Удаляю фон с твоего фото...")
-        cut_png = await remove_bg_pixelcut(image_bytes) # ИЗМЕНЕНО: Добавлен await
+        cut_png = await remove_bg_pixelcut(image_bytes)
 
         for i in range(n_variants):
             await msg.edit_text(f"Шаг 2/3: Генерирую сцену ({i+1}/{n_variants})...")
