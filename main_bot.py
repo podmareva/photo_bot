@@ -4,10 +4,11 @@ import os
 import io
 import base64
 import logging
+import socket
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -187,6 +188,37 @@ def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
     img.save(buf, format="JPEG", quality=95, optimize=True)
     return buf.getvalue()
 
+# ИЗМЕНЕНО: Добавлен специальный класс-резолвер для совместимости aiohttp и aiodns
+class CustomAiodnsResolver(aiohttp.resolver.AbstractResolver):
+    """Резолвер, который использует aiodns для разрешения хостов с кастомными DNS-серверами."""
+    def __init__(self, nameservers: List[str]):
+        self._resolver = aiodns.DNSResolver(nameservers=nameservers)
+
+    async def resolve(self, host: str, port: int, family: int = socket.AF_INET) -> List[Dict[str, Any]]:
+        try:
+            records = await self._resolver.query(host, 'A')
+        except aiodns.error.DNSError as e:
+            raise OSError(f"DNS resolution failed for {host}") from e
+
+        if not records:
+            raise OSError(f"No A records found for {host}")
+
+        return [
+            {
+                'hostname': host,
+                'host': record.host,
+                'port': port,
+                'family': family,
+                'proto': 0,
+                'flags': 0,
+            }
+            for record in records
+        ]
+
+    async def close(self) -> None:
+        pass
+
+
 async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     """
     Отправляет асинхронный запрос в Pixelcut, используя кастомный DNS-резолвер
@@ -210,9 +242,9 @@ async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
 
     timeout = aiohttp.ClientTimeout(total=120)
     
-    # ИЗМЕНЕНО: Создаем коннектор с DNS от Google, чтобы обойти проблемы хостинга
-    resolver = aiodns.DNSResolver(nameservers=['8.8.8.8', '1.1.1.1'])
-    connector = aiohttp.TCPConnector(resolver=resolver)
+    # ИЗМЕНЕНО: Создаем коннектор с нашим кастомным резолвером
+    resolver = CustomAiodnsResolver(nameservers=['8.8.8.8', '1.1.1.1'])
+    connector = aiohttp.TCPConnector(resolver=resolver, ssl=False) # ssl=False может понадобиться на некоторых хостингах
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         try:
@@ -381,7 +413,7 @@ async def send_cheatsheet(message: Message, state: FSMContext):
 async def pressed_start(message: Message, state: FSMContext):
     await message.answer(REQUIREMENTS)
     try:
-        await message.answer_document(FSInputFile(PROMPTS_FILE), caption="📓 Шпаргалка по промптам")
+        await message.answer_document(FSInputFile(PROMPTS_FILE), caption="📓 Шпаргалка по промтам")
     except Exception:
         pass
     await message.answer("Пришли фото товара (лучше как Документ).")
