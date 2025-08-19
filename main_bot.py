@@ -213,9 +213,9 @@ async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
 
     timeout = aiohttp.ClientTimeout(total=120)
     
-    # Создаем SSL-контекст, который будет проверять сертификат для hostname,
-    # даже если мы подключаемся к IP.
-    ssl_context = ssl.create_default_context(server_hostname=hostname)
+    # ИЗМЕНЕНО: Создаем SSL-контекст без несовместимого аргумента server_hostname.
+    # aiohttp будет использовать заголовок "Host" для проверки сертификата (SNI).
+    ssl_context = ssl.create_default_context()
     connector = aiohttp.TCPConnector(ssl=ssl_context)
 
     last_error = None
