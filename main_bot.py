@@ -205,16 +205,8 @@ async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     # Стабильные IP-адреса Cloudflare, на которых размещен сервис
     ips = ["172.67.175.10", "104.21.58.148"]
     
-    data = aiohttp.FormData()
-    data.add_field('image',
-                   BytesIO(jpg_bytes),
-                   filename='input.jpg',
-                   content_type='image/jpeg')
-
     timeout = aiohttp.ClientTimeout(total=120)
     
-    # ИЗМЕНЕНО: Создаем SSL-контекст без несовместимого аргумента server_hostname.
-    # aiohttp будет использовать заголовок "Host" для проверки сертификата (SNI).
     ssl_context = ssl.create_default_context()
     connector = aiohttp.TCPConnector(ssl=ssl_context)
 
@@ -222,6 +214,13 @@ async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         for ip in ips:
+            # ИЗМЕНЕНО: FormData создается заново для каждого запроса в цикле.
+            data = aiohttp.FormData()
+            data.add_field('image',
+                           BytesIO(jpg_bytes),
+                           filename='input.jpg',
+                           content_type='image/jpeg')
+            
             endpoint = f"https://{ip}/v1/remove-background"
             headers = {"X-API-Key": key, "Host": hostname}
             
