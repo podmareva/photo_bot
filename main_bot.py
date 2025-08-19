@@ -189,37 +189,10 @@ def ensure_jpg_bytes(image_bytes: bytes) -> bytes:
     img.save(buf, format="JPEG", quality=95, optimize=True)
     return buf.getvalue()
 
-# ИЗМЕНЕНО: Добавлен резолвер, использующий стандартную библиотеку socket в отдельном потоке
-class ThreadedResolver(aiohttp.resolver.AbstractResolver):
-    """Резолвер, который использует стандартный socket.getaddrinfo в пуле потоков."""
-    async def resolve(self, host: str, port: int, family: int = socket.AF_INET) -> List[Dict[str, Any]]:
-        loop = asyncio.get_running_loop()
-        try:
-            infos = await loop.run_in_executor(
-                None, socket.getaddrinfo, host, port, family, socket.SOCK_STREAM
-            )
-            hosts = []
-            for family, _, _, _, address in infos:
-                hosts.append({
-                    "hostname": host,
-                    "host": address[0],
-                    "port": address[1],
-                    "family": family,
-                    "proto": 0,
-                    "flags": socket.AI_NUMERICHOST,
-                })
-            return hosts
-        except socket.gaierror as e:
-            raise OSError(f"DNS resolution failed for host: {host}") from e
-
-    async def close(self) -> None:
-        pass
-
-
 async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     """
-    Отправляет асинхронный запрос в Pixelcut, используя надежный DNS-резолвер
-    для обхода проблем с DNS на хостинге.
+    Отправляет асинхронный запрос в Pixelcut напрямую по IP,
+    чтобы обойти проблемы с DNS на хостинге.
     """
     key = os.getenv("PIXELCUT_API_KEY", "").strip()
     if not key:
@@ -227,9 +200,10 @@ async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
 
     _validate_image_bytes(image_bytes)
     jpg_bytes = ensure_jpg_bytes(image_bytes)
-
-    endpoint = "https://api.pixelcut.ai/v1/remove-background"
-    headers = {"X-API-Key": key}
+    
+    hostname = "api.pixelcut.ai"
+    # Стабильные IP-адреса Cloudflare, на которых размещен сервис
+    ips = ["172.67.175.10", "104.21.58.148"]
     
     data = aiohttp.FormData()
     data.add_field('image',
@@ -239,35 +213,39 @@ async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
 
     timeout = aiohttp.ClientTimeout(total=120)
     
-    # ИЗМЕНЕНО: Создаем коннектор с нашим новым надежным резолвером
-    resolver = ThreadedResolver()
-    ssl_context = ssl.create_default_context()
-    connector = aiohttp.TCPConnector(resolver=resolver, ssl=ssl_context)
+    # Создаем SSL-контекст, который будет проверять сертификат для hostname,
+    # даже если мы подключаемся к IP.
+    ssl_context = ssl.create_default_context(server_hostname=hostname)
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+
+    last_error = None
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        try:
-            logging.info(f"Pixelcut: Отправляю aiohttp запрос с ThreadedResolver на {endpoint}...")
-            async with session.post(endpoint, headers=headers, data=data) as response:
-                if response.status == 200:
-                    logging.info("Pixelcut: Фон успешно удален.")
-                    return await response.read()
-                else:
-                    try:
-                        detail = await response.json()
-                    except Exception:
+        for ip in ips:
+            endpoint = f"https://{ip}/v1/remove-background"
+            headers = {"X-API-Key": key, "Host": hostname}
+            
+            try:
+                logging.info(f"Pixelcut: Пробую подключиться к {endpoint} (IP: {ip})...")
+                async with session.post(endpoint, headers=headers, data=data) as response:
+                    if response.status == 200:
+                        logging.info("Pixelcut: Фон успешно удален через прямое IP-соединение.")
+                        return await response.read()
+                    else:
                         detail = await response.text()
-                    
-                    error_message = f"Ошибка от API Pixelcut (статус {response.status}): {detail}"
-                    logging.error(error_message)
-                    
-                    if response.status == 401:
-                        raise RuntimeError("Ошибка авторизации (401) в Pixelcut. Проверьте правильность вашего API-ключа.")
-                    
-                    raise RuntimeError(error_message)
+                        logging.warning(f"Pixelcut: Ошибка от {ip} (статус {response.status}): {detail}")
+                        last_error = RuntimeError(f"Ошибка API (статус {response.status})")
+                        if response.status == 401:
+                           raise RuntimeError("Ошибка авторизации (401) в Pixelcut. Проверьте правильность вашего API-ключа.")
+                        continue # Пробуем следующий IP
 
-        except aiohttp.ClientError as e:
-            logging.error(f"Сетевая ошибка aiohttp при обращении к Pixelcut: {e}")
-            raise RuntimeError(f"Не удалось подключиться к сервису удаления фона: {e}")
+            except aiohttp.ClientError as e:
+                logging.error(f"Pixelcut: Ошибка соединения с {ip}: {e}")
+                last_error = e
+                continue # Пробуем следующий IP
+    
+    # Если все IP-адреса не сработали
+    raise RuntimeError(f"Не удалось подключиться к сервису удаления фона: {last_error}")
 
 
 # ====== Image Generation ======
