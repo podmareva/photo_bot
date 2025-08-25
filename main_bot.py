@@ -205,8 +205,16 @@ async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
     # Стабильные IP-адреса Cloudflare, на которых размещен сервис
     ips = ["172.67.175.10", "104.21.58.148"]
     
+    data = aiohttp.FormData()
+    data.add_field('image',
+                   BytesIO(jpg_bytes),
+                   filename='input.jpg',
+                   content_type='image/jpeg')
+
     timeout = aiohttp.ClientTimeout(total=120)
     
+    # ИЗМЕНЕНО: Создаем SSL-контекст без несовместимого аргумента server_hostname.
+    # aiohttp будет использовать заголовок "Host" для проверки сертификата (SNI).
     ssl_context = ssl.create_default_context()
     connector = aiohttp.TCPConnector(ssl=ssl_context)
 
@@ -214,13 +222,6 @@ async def remove_bg_pixelcut(image_bytes: bytes) -> bytes:
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         for ip in ips:
-            # ИЗМЕНЕНО: FormData создается заново для каждого запроса в цикле.
-            data = aiohttp.FormData()
-            data.add_field('image',
-                           BytesIO(jpg_bytes),
-                           filename='input.jpg',
-                           content_type='image/jpeg')
-            
             endpoint = f"https://{ip}/v1/remove-background"
             headers = {"X-API-Key": key, "Host": hostname}
             
@@ -523,9 +524,55 @@ async def on_shutdown_app(app: web.Application):
     await bot.delete_webhook()
     await bot.session.close()
 
+async def albato_generate_handler(request):
+    try:
+        data = await request.json()
+        file_id = data.get("file_id")
+        style = data.get("style", "studio soft light")
+        aspect = data.get("aspect", "1:1")
+        placement = data.get("placement", "Студийно (на фоне)")
+
+        if not file_id:
+            return web.json_response({"error": "file_id is required"}, status=400)
+
+        image_bytes = await load_bytes_by_file_id(bot, file_id)
+        cut_png = await remove_bg_pixelcut(image_bytes)
+
+        prompt = style
+        if placement == "Студийно (на фоне)":
+            prompt += ". Background only, no product. photorealistic, studio lighting, realistic textures, no text."
+        elif placement == "На человеке (украшение/одежда)":
+            prompt += ". photorealistic human portrait, neutral background, soft diffused light, no text."
+        else:
+            prompt += ". photorealistic hands close-up, neutral background, macro-friendly composition, no text."
+
+        bg = generate_background(prompt, size=pick_openai_size(aspect))
+        bg = center_crop_to_aspect(bg, aspect)
+
+        if placement == "Студийно (на фоне)":
+            result = compose_subject_on_bg(cut_png, bg, scale_by_height=0.74, x_shift=0.0, y_shift=-0.06)
+        elif placement == "На человеке (украшение/одежда)":
+            bw, bh = bg.size
+            result = seamless_place(cut_png, bg, scale_by_height=0.26, x=int(bw*0.5), y=int(bh*0.38))
+        else:
+            bw, bh = bg.size
+            result = seamless_place(cut_png, bg, scale_by_height=0.40, x=int(bw*0.5), y=int(bh*0.5))
+
+        buf = io.BytesIO()
+        result.save(buf, format="PNG")
+        encoded_image = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        return web.json_response({"image_base64": encoded_image})
+
+    except Exception as e:
+        logging.exception("Albato Webhook Error")
+        return web.json_response({"error": str(e)}, status=500)
+
 app = web.Application()
 SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
 setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_app)
+
+app.router.add_post("/albato-generate", albato_generate_handler)
 
 if __name__ == "__main__":
     web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
