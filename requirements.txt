@@ -4,8 +4,8 @@ Pillow
 requests
 psycopg2-binary
 opencv-python-headless
-numpy==1.26.4        # <— фикс
+numpy==1.26.4
 python-dotenv
-onnxruntime==1.17.3  # совместим с numpy 1.26.x
+onnxruntime==1.17.3
 rembg==2.0.57
 aiodns
