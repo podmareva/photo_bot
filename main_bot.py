@@ -40,8 +40,10 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PIXELCUT_API_KEY = os.getenv("PIXELCUT_API_KEY")
-# WEBHOOK_BASE_URL - это публичный URL, который предоставляет Railway
-WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL")
+
+# WEBHOOK_BASE_URL - это публичный URL, который предоставляет Railway.
+# Убираем лишние символы на всякий случай.
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip().rstrip('/')
 
 # Необязательные переменные
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -385,18 +387,30 @@ async def generate_result(message: Message, state: FSMContext):
 
 async def on_startup(bot_instance: Bot):
     """Действия при старте приложения."""
+    logging.info("--> Выполняется on_startup...")
     webhook_url = f"{WEBHOOK_BASE_URL}/webhook/{BOT_TOKEN}"
-    await bot_instance.set_webhook(webhook_url, drop_pending_updates=True)
-    me = await bot.get_me()
-    logging.info("Бот @%s запущен через вебхук: %s", me.username, webhook_url)
+    logging.info("--> URL для вебхука: %s", webhook_url)
+    try:
+        await bot_instance.set_webhook(webhook_url, drop_pending_updates=True)
+        me = await bot.get_me()
+        logging.info("--> Вебхук успешно установлен для бота @%s", me.username)
+    except Exception as e:
+        logging.error("--> !!! ОШИБКА установки вебхука: %s", e)
+
 
 async def on_shutdown(bot_instance: Bot):
     """Действия при остановке приложения."""
-    logging.info("Остановка бота...")
+    logging.info("--> Выполняется on_shutdown...")
     await bot_instance.delete_webhook()
     await bot.session.close()
+    logging.info("--> Бот остановлен, вебхук удален.")
+
+async def health_check(request):
+    """Простой обработчик для проверки, что сервер жив."""
+    return web.Response(text="I'm alive!")
 
 def main():
+    logging.info("--> Запуск main()...")
     # Создаем приложение aiohttp
     app = web.Application()
     
@@ -404,16 +418,22 @@ def main():
     app.on_startup.append(lambda a: on_startup(bot))
     app.on_shutdown.append(lambda a: on_shutdown(bot))
 
+    # Добавляем маршрут для проверки "здоровья"
+    app.router.add_get("/health", health_check)
+
     # Создаем и регистрируем обработчик вебхуков для aiogram
     webhook_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
     )
     webhook_handler.register(app, path=f"/webhook/{BOT_TOKEN}")
+    
+    logging.info("--> Настройка веб-сервера завершена.")
 
     # Запускаем приложение
     # Railway сам предоставит нужный PORT в переменной окружения
     port = int(os.environ.get("PORT", 8080))
+    logging.info("--> Запуск веб-сервера на порту %s", port)
     web.run_app(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
