@@ -413,7 +413,7 @@ def main():
     logging.info("--> Запуск main()...")
     # Создаем приложение aiohttp
     app = web.Application()
-    
+
     # Регистрируем хэндлеры для старта и остановки
     app.on_startup.append(lambda a: on_startup(bot))
     app.on_shutdown.append(lambda a: on_shutdown(bot))
@@ -427,15 +427,15 @@ def main():
         bot=bot,
     )
     webhook_handler.register(app, path=f"/webhook/{BOT_TOKEN}")
-    
-    logging.info("--> Настройка веб-сервера завершена.")
 
-    # Запускаем приложение
-    # Railway сам предоставит нужный PORT в переменной окружения
-    port = int(os.environ.get("PORT", 8080))
+# Функция main теперь будет просто содержать запуск сервера, если вы хотите его использовать для локального тестирования
+def main():
+    logging.info("--> Запуск main()...")
+    port = int(os.environ.get("PORT", 8000))
     logging.info("--> Запуск веб-сервера на порту %s", port)
     web.run_app(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
+
 
