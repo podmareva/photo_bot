@@ -517,6 +517,7 @@ assert BASE_URL, "WEBHOOK_BASE_URL или RENDER_EXTERNAL_URL должны бы�
 WEBHOOK_URL = BASE_URL + WEBHOOK_PATH
 
 async def on_startup_app(app: web.Application):
+    print("🔃 on_startup_app запущен")
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
     await _log_bot_info()
 
