@@ -510,6 +510,21 @@ async def generate_result(message: Message, state: FSMContext):
         await message.answer(f"Что-то пошло не так 😥\nОшибка: {e}\n\nПопробуй ещё раз или начни с /start.")
         # Стейт не чистим, чтобы можно было повторить/исправить
 
+from aiogram import types
+
+routes = web.RouteTableDef()  # если уже есть — не дублируй
+
+@routes.post(f"/webhook/{BOT_TOKEN}")
+async def telegram_webhook(request):
+    try:
+        data = await request.json()
+        update = types.Update(**data)
+        await dp.feed_update(bot, update)
+        return web.Response(text="OK")
+    except Exception as e:
+        logging.exception("Webhook handling error")
+        return web.Response(status=500, text=str(e))
+
 # === Webhook server ===
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
@@ -525,14 +540,19 @@ async def on_shutdown_app(app: web.Application):
     await bot.delete_webhook()
     await bot.session.close()
 
-app = web.Application()
-SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_app)
+# Устанавливаем webhook при запуске
+async def on_startup(app):
+    webhook_url = f"https://{ВАШ_ДОМЕН}/webhook/{BOT_TOKEN}"
+    await bot.set_webhook(webhook_url)
 
-print("✅ Запуск main_bot.py")
-print("BOT_TOKEN:", BOT_TOKEN[:10], "...")
-print("BASE_URL:", BASE_URL)
-print("WEBHOOK_URL:", WEBHOOK_URL)
+# Удаляем webhook при остановке (по желанию)
+async def on_shutdown(app):
+    await bot.delete_webhook()
+
+app = web.Application()
+app.add_routes(routes)
+app.on_startup.append(on_startup)
+app.on_shutdown.append(on_shutdown)
 
 if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
