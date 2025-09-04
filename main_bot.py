@@ -574,5 +574,10 @@ setup_application(app, dp, on_startup=on_startup_app, on_shutdown=on_shutdown_ap
 
 app.router.add_post("/albato-generate", albato_generate_handler)
 
+print("✅ Запуск main_bot.py")
+print("BOT_TOKEN:", BOT_TOKEN[:10], "...")
+print("BASE_URL:", BASE_URL)
+print("WEBHOOK_URL:", WEBHOOK_URL)
+
 if __name__ == "__main__":
     web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
