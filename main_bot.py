@@ -57,6 +57,18 @@ async def _log_bot_info():
     me = await bot.get_me()
     logging.info("Bot: @%s (%s)", me.username, me.id)
 
+from aiohttp import web
+from aiogram import types
+
+routes = web.RouteTableDef()
+
+@routes.post(f"/webhook/{BOT_TOKEN}")
+async def telegram_webhook(request: web.Request):
+    data = await request.json()
+    update = types.Update(**data)
+    await dp.feed_update(bot, update)
+    return web.Response(text="OK")
+
 # ===== TEXTS =====
 WELCOME = (
     "👋 Привет! Ты в боте «Предметный фотограф».\n\n"
@@ -549,6 +561,13 @@ async def on_startup(app):
 async def on_shutdown(app):
     await bot.delete_webhook()
 
+async def on_startup(app):
+    webhook_url = f"https://{твой_домен}.up.railway.app/webhook/{BOT_TOKEN}"
+    await bot.set_webhook(webhook_url, drop_pending_updates=True)
+
+async def on_shutdown(app):
+    await bot.delete_webhook()
+
 app = web.Application()
 app.add_routes(routes)
 app.on_startup.append(on_startup)
@@ -556,3 +575,4 @@ app.on_shutdown.append(on_shutdown)
 
 if __name__ == "__main__":
     web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
