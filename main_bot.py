@@ -383,43 +383,52 @@ async def generate_result(message: Message, state: FSMContext):
         await state.set_state(GenStates.waiting_photo) # Возвращаем на шаг отправки фото
 
 
-# ========= 6. ЗАПУСК БОТА (ВЕБХУК) =========
+# === Вебхук и функции старта/остановки ===
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+BASE_URL = os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL")
+if not BASE_URL:
+    raise RuntimeError("WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL environment variable is not set!")
+WEBHOOK_URL = BASE_URL.rstrip('/') + WEBHOOK_PATH
 
-async def on_startup(bot_instance: Bot):
-    """Действия при старте приложения."""
-    logging.info("--> Выполняется on_startup...")
-    webhook_url = f"{WEBHOOK_BASE_URL}/webhook/{BOT_TOKEN}"
-    logging.info("--> URL для вебхука: %s", webhook_url)
+routes = web.RouteTableDef()
+
+@routes.post(WEBHOOK_PATH)
+async def telegram_webhook(request: web.Request):
     try:
-        await bot_instance.set_webhook(webhook_url, drop_pending_updates=True)
-        me = await bot.get_me()
-        logging.info("--> Вебхук успешно установлен для бота @%s", me.username)
+        data = await request.json()
+        update = types.Update.model_validate(data)
+        await dp.feed_update(bot, update)
+        return web.Response(text="OK")
     except Exception as e:
-        logging.error("--> !!! ОШИБКА установки вебхука: %s", e)
+        logging.exception("Webhook handling error")
+        return web.Response(status=500, text=str(e))
 
+# Health check для Railway
+@routes.get("/health")
+async def health_check(request: web.Request):
+    return web.Response(text="OK")
 
-async def on_shutdown(bot_instance: Bot):
-    """Действия при остановке приложения."""
-    logging.info("--> Выполняется on_shutdown...")
-    await bot_instance.delete_webhook()
+async def on_startup(app: web.Application):
+    logging.info("-> Выполняется on_startup...")
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    await _log_bot_info()
+    logging.info(f"✔ Вебхук успешно установлен: {WEBHOOK_URL}")
+
+async def on_shutdown(app: web.Application):
+    logging.info("-> Выполняется on_shutdown...")
+    await bot.delete_webhook()
     await bot.session.close()
-    logging.info("--> Бот остановлен, вебхук удален.")
+    logging.info("-> Бот остановлен, вебхук удален.")
 
-async def health_check(request):
-    """Простой обработчик для проверки, что сервер жив."""
-    return web.Response(text="I'm alive!")
-
+# Основная функция запуска приложения
 def main():
-    logging.info("--> Запуск main()...")
-    # Создаем приложение aiohttp
-    app = web.Application()
+    logging.info("-> Запуск main()...")
+    app = web.Application() # <-- Теперь app определено здесь
+    app.add_routes(routes)
 
     # Регистрируем хэндлеры для старта и остановки
-    app.on_startup.append(lambda a: on_startup(bot))
-    app.on_shutdown.append(lambda a: on_shutdown(bot))
-
-    # Добавляем маршрут для проверки "здоровья"
-    app.router.add_get("/health", health_check)
+    app.on_startup.append(on_startup) # <-- Передаем ссылку на функцию
+    app.on_shutdown.append(on_shutdown) # <-- Передаем ссылку на функцию
 
     # Создаем и регистрируем обработчик вебхуков для aiogram
     webhook_handler = SimpleRequestHandler(
@@ -428,14 +437,15 @@ def main():
     )
     webhook_handler.register(app, path=f"/webhook/{BOT_TOKEN}")
 
-# Функция main теперь будет просто содержать запуск сервера, если вы хотите его использовать для локального тестирования
-def main():
-    logging.info("--> Запуск main()...")
     port = int(os.environ.get("PORT", 8000))
-    logging.info("--> Запуск веб-сервера на порту %s", port)
+    logging.info(f"-> Запуск веб-сервера на порту {port}")
     web.run_app(app, host="0.0.0.0", port=port)
+    logging.info("-> Настройка веб-сервера завершена.")
 
 if __name__ == "__main__":
-    main()
-
-
+    try:
+        main()
+    except Exception as e:
+        logging.error(f"FATAL ERROR: Приложение бота завершилось неожиданно: {e}", exc_info=True)
+        import time
+        time.sleep(10)
