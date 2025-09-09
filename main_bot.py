@@ -411,9 +411,8 @@ async def health_check(request: web.Request):
 async def on_startup(app: web.Application):
     logging.info("-> Выполняется on_startup...")
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-    await _logging.info()
     logging.info(f"✔ Вебхук успешно установлен: {WEBHOOK_URL}")
-
+    
 async def on_shutdown(app: web.Application):
     logging.info("-> Выполняется on_shutdown...")
     await bot.delete_webhook()
